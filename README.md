@@ -10,6 +10,8 @@ Local prototype for running Natural Language Autoencoder inference with patched 
 
 ![NLA demo](demo.gif)
 
+Features a built-in extended [Mikupad](https://github.com/lmg-anon/mikupad) UI for NLA.
+
 ## Model roles
 
 Full roundtrip uses three models:
