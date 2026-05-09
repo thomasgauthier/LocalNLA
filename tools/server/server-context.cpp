@@ -21,6 +21,10 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <regex>
 #include <utility>
 
 // fix problem with std::min and std::max
@@ -35,6 +39,10 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+constexpr llama_seq_id NLA_SEQ_ID = 0;
+
+struct server_context_impl;
+static bool server_nla_eval_cb(struct ggml_tensor * t, bool ask, void * user_data);
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, bool on_device, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
@@ -660,6 +668,451 @@ public:
         }
     }
 
+    std::mutex nla_mutex;
+    bool nla_extract_active = false;
+    std::string nla_extract_tensor;
+    std::vector<float> nla_extract_values;
+    int64_t nla_extract_n_tokens = 0;
+
+    bool nla_eval_cb(struct ggml_tensor * t, bool ask) {
+        if (!nla_extract_active) {
+            return false;
+        }
+        const std::string name(t->name);
+        if (name != nla_extract_tensor) {
+            return false;
+        }
+        if (ask) {
+            return true;
+        }
+        const int64_t n_el = ggml_nelements(t);
+        nla_extract_values.resize(n_el);
+        nla_extract_n_tokens = t->ne[1];
+        if (ggml_backend_buffer_is_host(t->buffer)) {
+            for (int64_t i = 0; i < n_el; i++) {
+                nla_extract_values[i] = ggml_get_f32_1d(t, i);
+            }
+        } else {
+            std::vector<uint8_t> buf(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+            ggml_tensor tmp = *t;
+            tmp.data = buf.data();
+            tmp.buffer = nullptr;
+            for (int64_t i = 0; i < n_el; i++) {
+                nla_extract_values[i] = ggml_get_f32_1d(&tmp, i);
+            }
+        }
+        return true;
+    }
+
+    static void nla_normalize(std::vector<float> & v, float scale) {
+        double ss = 0.0;
+        for (float x : v) ss += double(x) * double(x);
+        const double n = std::sqrt(ss);
+        if (n < 1e-12) return;
+        const float a = float(scale / n);
+        for (float & x : v) x *= a;
+    }
+
+    static double nla_norm(const std::vector<float> & v) {
+        double ss = 0.0;
+        for (float x : v) ss += double(x) * double(x);
+        return std::sqrt(ss);
+    }
+
+    bool nla_eval_tokens(const std::vector<llama_token> & toks, int start_pos, bool logits_last) {
+        if (toks.empty()) return true;
+        llama_batch b = llama_batch_init((int32_t)toks.size(), 0, 1);
+        b.n_tokens = (int32_t)toks.size();
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            b.token[i] = toks[i];
+            b.pos[i] = start_pos + i;
+            b.n_seq_id[i] = 1;
+            b.seq_id[i][0] = NLA_SEQ_ID;
+            b.logits[i] = logits_last && i == b.n_tokens - 1;
+        }
+        const int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        return rc == 0;
+    }
+
+    bool nla_eval_embedding(const std::vector<float> & embd, int pos, bool logits) {
+        llama_batch b = llama_batch_init(1, (int32_t)embd.size(), 1);
+        b.n_tokens = 1;
+        memcpy(b.embd, embd.data(), sizeof(float) * embd.size());
+        b.pos[0] = pos;
+        b.n_seq_id[0] = 1;
+        b.seq_id[0][0] = NLA_SEQ_ID;
+        b.logits[0] = logits;
+        const int rc = llama_decode(ctx, b);
+        llama_batch_free(b);
+        return rc == 0;
+    }
+
+    json nla_extract(const json & body) {
+        std::lock_guard<std::mutex> lock(nla_mutex);
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+
+        const int layer = json_value(body, "layer", 20);
+        int token_pos = json_value(body, "token_pos", -1);
+        const bool add_special = json_value(body, "add_special", true);
+        const bool parse_special = json_value(body, "parse_special", true);
+        if (!body.contains("prompt")) {
+            throw std::runtime_error("/extract requires 'prompt'");
+        }
+        auto prompts = tokenize_input_prompts(vocab, mctx, body.at("prompt"), add_special, parse_special);
+        std::vector<llama_token> toks = prompts[0].get_text_tokens();
+        if (toks.empty()) {
+            throw std::runtime_error("prompt tokenized to empty sequence");
+        }
+        if (token_pos < 0) token_pos = (int)toks.size() + token_pos;
+        if (token_pos < 0 || token_pos >= (int)toks.size()) {
+            throw std::runtime_error("token_pos out of range");
+        }
+
+        nla_extract_tensor = "l_out-" + std::to_string(layer);
+        nla_extract_values.clear();
+        nla_extract_n_tokens = 0;
+        nla_extract_active = true;
+        llama_set_embeddings(ctx, true);
+        const bool ok = nla_eval_tokens(toks, 0, false);
+        llama_set_embeddings(ctx, false);
+        nla_extract_active = false;
+        if (!ok) {
+            throw std::runtime_error("llama_decode failed during /extract");
+        }
+        if (nla_extract_values.empty()) {
+            throw std::runtime_error("failed to capture tensor " + nla_extract_tensor + " (is cb_eval enabled?)");
+        }
+
+        const int d_model = llama_model_n_embd(model);
+        if ((int64_t)nla_extract_values.size() != (int64_t)d_model * nla_extract_n_tokens) {
+            throw std::runtime_error("captured tensor shape mismatch");
+        }
+        std::vector<float> act(d_model);
+        for (int i = 0; i < d_model; ++i) {
+            act[i] = nla_extract_values[(int64_t)token_pos * d_model + i];
+        }
+        json arr = json::array();
+        for (float x : act) arr.push_back(x);
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        return json{
+            {"layer", layer},
+            {"tensor", nla_extract_tensor},
+            {"token_pos", token_pos},
+            {"token_id", toks[token_pos]},
+            {"n_tokens", toks.size()},
+            {"d_model", d_model},
+            {"norm", nla_norm(act)},
+            {"activation", std::move(arr)},
+        };
+    }
+
+    json nla_explain(const json & body) {
+        std::lock_guard<std::mutex> lock(nla_mutex);
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+
+        if (!body.contains("activation") || !body.contains("input_ids") || !body.contains("inject_pos")) {
+            throw std::runtime_error("/explain requires activation, input_ids, inject_pos");
+        }
+        std::vector<float> act = body.at("activation").get<std::vector<float>>();
+        std::vector<llama_token> ids = body.at("input_ids").get<std::vector<llama_token>>();
+        const int inject_pos = body.at("inject_pos").get<int>();
+        const bool normalize = json_value(body, "normalize", true);
+        const float scale = json_value(body, "scale", 150.0f);
+        const int n_predict = json_value(body, "n_predict", json_value(body, "max_new_tokens", 200));
+
+        const int d_model = llama_model_n_embd(model);
+        if ((int)act.size() != d_model) throw std::runtime_error("activation length != model n_embd");
+        if (inject_pos < 0 || inject_pos >= (int)ids.size()) throw std::runtime_error("inject_pos out of range");
+        if (normalize) nla_normalize(act, scale);
+
+        std::vector<llama_token> prefix(ids.begin(), ids.begin() + inject_pos);
+        std::vector<llama_token> suffix(ids.begin() + inject_pos + 1, ids.end());
+        if (!nla_eval_tokens(prefix, 0, false)) throw std::runtime_error("failed to eval prefix");
+        if (!nla_eval_embedding(act, inject_pos, suffix.empty())) throw std::runtime_error("failed to eval injection embedding");
+        if (!nla_eval_tokens(suffix, inject_pos + 1, true)) throw std::runtime_error("failed to eval suffix");
+
+        auto sparams = llama_sampler_chain_default_params();
+        llama_sampler * smpl = llama_sampler_chain_init(sparams);
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(json_value(body, "top_k", params_base.sampling.top_k)));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(json_value(body, "top_p", params_base.sampling.top_p), params_base.sampling.min_keep));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(json_value(body, "temperature", params_base.sampling.temp)));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(json_value(body, "seed", params_base.sampling.seed)));
+
+        std::string text;
+        int n_gen = 0;
+        for (int i = 0; i < n_predict; ++i) {
+            llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(vocab, tok)) break;
+            text += common_token_to_piece(ctx, tok, true);
+            std::vector<llama_token> one = { tok };
+            if (!nla_eval_tokens(one, (int)ids.size() + i, true)) break;
+            n_gen++;
+            if (text.find("</explanation>") != std::string::npos) break;
+        }
+        llama_sampler_free(smpl);
+
+        std::string explanation;
+        std::smatch m;
+        static const std::regex re("<explanation>\\s*([\\s\\S]*?)\\s*</explanation>");
+        if (std::regex_search(text, m, re)) {
+            explanation = m[1].str();
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        return json{
+            {"text", text},
+            {"explanation", explanation},
+            {"d_model", d_model},
+            {"scale", scale},
+            {"normalized_norm", nla_norm(act)},
+            {"n_prompt_tokens", ids.size()},
+            {"n_generated_tokens", n_gen},
+        };
+    }
+
+    std::string nla_meta_str(const char * key, const std::string & fallback = "") const {
+        std::vector<char> buf(4096);
+        int32_t n = llama_model_meta_val_str(model, key, buf.data(), buf.size());
+        if (n < 0) {
+            return fallback;
+        }
+        if ((size_t) n >= buf.size()) {
+            buf.resize((size_t) n + 1);
+            n = llama_model_meta_val_str(model, key, buf.data(), buf.size());
+            if (n < 0) {
+                return fallback;
+            }
+        }
+        return std::string(buf.data(), (size_t) n);
+    }
+
+    int nla_meta_int(const char * key, int fallback) const {
+        const std::string s = nla_meta_str(key);
+        if (s.empty()) return fallback;
+        return std::atoi(s.c_str());
+    }
+
+    float nla_meta_float(const char * key, float fallback) const {
+        const std::string s = nla_meta_str(key);
+        if (s.empty()) return fallback;
+        return std::atof(s.c_str());
+    }
+
+    std::vector<float> nla_load_value_head_from_gguf(int d_model) const {
+        const std::string path = params_base.model.path;
+        gguf_init_params gip = { /* no_alloc */ true, /* ctx */ nullptr };
+        gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+        if (gctx == nullptr) {
+            throw std::runtime_error("failed to open GGUF for NLA value head: " + path);
+        }
+
+        const int64_t tid = gguf_find_tensor(gctx, "nla.value_head.weight");
+        if (tid < 0) {
+            gguf_free(gctx);
+            throw std::runtime_error("model GGUF does not contain tensor nla.value_head.weight");
+        }
+
+        const enum ggml_type typ = gguf_get_tensor_type(gctx, tid);
+        const size_t nbytes = gguf_get_tensor_size(gctx, tid);
+        const size_t expect_f32  = (size_t) d_model * d_model * sizeof(float);
+        const size_t expect_f16  = (size_t) d_model * d_model * sizeof(ggml_fp16_t);
+        const size_t expect_bf16 = (size_t) d_model * d_model * sizeof(ggml_bf16_t);
+        if ((typ == GGML_TYPE_F32 && nbytes != expect_f32) ||
+            (typ == GGML_TYPE_F16 && nbytes != expect_f16) ||
+            (typ == GGML_TYPE_BF16 && nbytes != expect_bf16)) {
+            gguf_free(gctx);
+            throw std::runtime_error("nla.value_head.weight has unexpected type or size");
+        }
+
+        FILE * fp = std::fopen(path.c_str(), "rb");
+        if (fp == nullptr) {
+            gguf_free(gctx);
+            throw std::runtime_error("failed to reopen GGUF for value-head data");
+        }
+        const size_t offset = gguf_get_data_offset(gctx) + gguf_get_tensor_offset(gctx, tid);
+        if (std::fseek(fp, (long) offset, SEEK_SET) != 0) {
+            std::fclose(fp);
+            gguf_free(gctx);
+            throw std::runtime_error("failed to seek to nla.value_head.weight");
+        }
+        std::vector<uint8_t> raw(nbytes);
+        if (std::fread(raw.data(), 1, nbytes, fp) != nbytes) {
+            std::fclose(fp);
+            gguf_free(gctx);
+            throw std::runtime_error("failed to read nla.value_head.weight");
+        }
+        std::fclose(fp);
+        gguf_free(gctx);
+
+        std::vector<float> weight((size_t) d_model * d_model);
+        if (typ == GGML_TYPE_F32) {
+            memcpy(weight.data(), raw.data(), nbytes);
+        } else if (typ == GGML_TYPE_F16) {
+            const ggml_fp16_t * p = reinterpret_cast<const ggml_fp16_t *>(raw.data());
+            for (size_t i = 0; i < weight.size(); ++i) weight[i] = ggml_fp16_to_fp32(p[i]);
+        } else if (typ == GGML_TYPE_BF16) {
+            const ggml_bf16_t * p = reinterpret_cast<const ggml_bf16_t *>(raw.data());
+            for (size_t i = 0; i < weight.size(); ++i) weight[i] = ggml_bf16_to_fp32(p[i]);
+        } else {
+            throw std::runtime_error("unsupported nla.value_head.weight GGML type");
+        }
+        return weight;
+    }
+
+    struct nla_reconstruct_result {
+        std::vector<float> activation;
+        int d_model = 0;
+        int layer = 0;
+        std::string tensor;
+        float mse_scale = 0.0f;
+        size_t n_prompt_tokens = 0;
+        double norm = 0.0;
+    };
+
+    nla_reconstruct_result nla_reconstruct_no_lock(const json & body) {
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+
+        if (!body.contains("explanation")) {
+            throw std::runtime_error("reconstruct requires 'explanation'");
+        }
+        const std::string role = nla_meta_str("nla.role");
+        if (!role.empty() && role != "critic" && role != "ar") {
+            throw std::runtime_error("model metadata nla.role is not 'critic' or 'ar'");
+        }
+
+        const int d_model = llama_model_n_embd(model);
+        const int layer = json_value(body, "layer", nla_meta_int("nla.extraction_layer", 20));
+        const float mse_scale = json_value(body, "mse_scale", nla_meta_float("nla.mse_scale", 59.866518f));
+        const std::string default_template = "Summary of the following text: <text>{explanation}</text> <summary>";
+        std::string tmpl = json_value(body, "template", nla_meta_str("nla.prompt_template.ar", default_template));
+        const std::string explanation = body.at("explanation").get<std::string>();
+        const std::string marker = "{explanation}";
+        const size_t p = tmpl.find(marker);
+        const std::string prompt = p == std::string::npos ? tmpl + explanation : tmpl.replace(p, marker.size(), explanation);
+
+        auto prompts = tokenize_input_prompts(vocab, mctx, prompt, json_value(body, "add_special", true), json_value(body, "parse_special", true));
+        std::vector<llama_token> toks = prompts[0].get_text_tokens();
+        if (toks.empty()) {
+            throw std::runtime_error("reconstruct prompt tokenized to empty sequence");
+        }
+
+        nla_extract_tensor = "l_out-" + std::to_string(layer);
+        nla_extract_values.clear();
+        nla_extract_n_tokens = 0;
+        nla_extract_active = true;
+        llama_set_embeddings(ctx, true);
+        const bool ok = nla_eval_tokens(toks, 0, false);
+        llama_set_embeddings(ctx, false);
+        nla_extract_active = false;
+        if (!ok) {
+            throw std::runtime_error("llama_decode failed during reconstruct");
+        }
+        if (nla_extract_values.empty()) {
+            throw std::runtime_error("failed to capture tensor " + nla_extract_tensor);
+        }
+        if ((int64_t)nla_extract_values.size() != (int64_t)d_model * nla_extract_n_tokens) {
+            throw std::runtime_error("captured reconstruct tensor shape mismatch");
+        }
+
+        std::vector<float> h(d_model);
+        const int token_pos = (int)toks.size() - 1;
+        for (int i = 0; i < d_model; ++i) {
+            h[i] = nla_extract_values[(int64_t)token_pos * d_model + i];
+        }
+
+        const std::vector<float> weight = nla_load_value_head_from_gguf(d_model);
+        std::vector<float> pred(d_model, 0.0f);
+        for (int out = 0; out < d_model; ++out) {
+            double acc = 0.0;
+            const float * row = weight.data() + (size_t) out * d_model;
+            for (int in = 0; in < d_model; ++in) {
+                acc += (double) row[in] * h[in];
+            }
+            pred[out] = (float) acc;
+        }
+
+        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        const double pred_norm = nla_norm(pred);
+        return nla_reconstruct_result{
+            /* activation      */ std::move(pred),
+            /* d_model         */ d_model,
+            /* layer           */ layer,
+            /* tensor          */ nla_extract_tensor,
+            /* mse_scale       */ mse_scale,
+            /* n_prompt_tokens */ toks.size(),
+            /* norm            */ pred_norm,
+        };
+    }
+
+    static json nla_activation_json(const std::vector<float> & v) {
+        json arr = json::array();
+        for (float x : v) arr.push_back(x);
+        return arr;
+    }
+
+    static json nla_reconstruct_result_json(const nla_reconstruct_result & r) {
+        return json{
+            {"d_model", r.d_model},
+            {"layer", r.layer},
+            {"tensor", r.tensor},
+            {"mse_scale", r.mse_scale},
+            {"n_prompt_tokens", r.n_prompt_tokens},
+            {"norm", r.norm},
+            {"activation", nla_activation_json(r.activation)},
+        };
+    }
+
+    json nla_reconstruct(const json & body) {
+        std::lock_guard<std::mutex> lock(nla_mutex);
+        return nla_reconstruct_result_json(nla_reconstruct_no_lock(body));
+    }
+
+    json nla_score(const json & body) {
+        std::lock_guard<std::mutex> lock(nla_mutex);
+        if (!body.contains("activation") && !body.contains("original") && !body.contains("extracted")) {
+            throw std::runtime_error("/score requires extracted vector in 'activation' (or 'original'/'extracted')");
+        }
+        std::vector<float> gold;
+        if (body.contains("activation")) {
+            gold = body.at("activation").get<std::vector<float>>();
+        } else if (body.contains("original")) {
+            gold = body.at("original").get<std::vector<float>>();
+        } else {
+            gold = body.at("extracted").get<std::vector<float>>();
+        }
+
+        const int d_model = llama_model_n_embd(model);
+        if ((int)gold.size() != d_model) throw std::runtime_error("activation length != model n_embd");
+
+        nla_reconstruct_result rec = nla_reconstruct_no_lock(body);
+        const std::vector<float> & pred = rec.activation;
+        const float mse_scale = rec.mse_scale;
+        std::vector<float> pred_n = pred;
+        std::vector<float> gold_n = gold;
+        nla_normalize(pred_n, mse_scale);
+        nla_normalize(gold_n, mse_scale);
+        double dot = 0.0, ss_pred = 0.0, ss_gold = 0.0, mse = 0.0;
+        for (int i = 0; i < d_model; ++i) {
+            dot += (double)pred_n[i] * gold_n[i];
+            ss_pred += (double)pred_n[i] * pred_n[i];
+            ss_gold += (double)gold_n[i] * gold_n[i];
+            const double diff = (double)pred_n[i] - gold_n[i];
+            mse += diff * diff;
+        }
+        return json{
+            {"mse", mse / d_model},
+            {"cos", dot / std::sqrt(ss_pred * ss_gold)},
+            {"d_model", d_model},
+            {"layer", rec.layer},
+            {"tensor", rec.tensor},
+            {"mse_scale", mse_scale},
+            {"n_prompt_tokens", rec.n_prompt_tokens},
+            {"reconstructed_norm", rec.norm},
+            {"activation_norm", nla_norm(gold)},
+        };
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -756,6 +1209,9 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+        params_base.cb_eval = server_nla_eval_cb;
+        params_base.cb_eval_user_data = this;
+        params_base.warmup = false;
 
         llama_init = common_init_from_params(params_base);
 
@@ -3097,6 +3553,11 @@ bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
 }
 
+static bool server_nla_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * impl = static_cast<server_context_impl *>(user_data);
+    return impl != nullptr && impl->nla_eval_cb(t, ask);
+}
+
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -3986,6 +4447,50 @@ void server_routes::init_routes() {
         }
 
         res->ok(json{{"content", std::move(content)}});
+        return res;
+    };
+
+    this->post_extract = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            const json body = json::parse(req.body);
+            res->ok(const_cast<server_context_impl &>(ctx_server).nla_extract(body));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+        return res;
+    };
+
+    this->post_explain = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            const json body = json::parse(req.body);
+            res->ok(const_cast<server_context_impl &>(ctx_server).nla_explain(body));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+        return res;
+    };
+
+    this->post_reconstruct = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            const json body = json::parse(req.body);
+            res->ok(const_cast<server_context_impl &>(ctx_server).nla_reconstruct(body));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+        return res;
+    };
+
+    this->post_score = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            const json body = json::parse(req.body);
+            res->ok(const_cast<server_context_impl &>(ctx_server).nla_score(body));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
         return res;
     };
 

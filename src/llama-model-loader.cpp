@@ -573,6 +573,10 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            if (tensor_name.rfind("nla.", 0) == 0) {
+                LLAMA_LOG_INFO("%s: preserving application tensor %s outside core model loader\n", __func__, tensor_name.c_str());
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -639,6 +643,10 @@ llama_model_loader::llama_model_loader(
                 // Save tensors data offset info of the shard.
                 for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                     std::string tensor_name = std::string(cur->name);
+                    if (tensor_name.rfind("nla.", 0) == 0) {
+                        LLAMA_LOG_INFO("%s: preserving application tensor %s outside core model loader\n", __func__, tensor_name.c_str());
+                        continue;
+                    }
                     // make sure there is no duplicated tensor names
                     if (weights_map.find(tensor_name) != weights_map.end()) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -683,6 +691,10 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset info of the main file.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            if (tensor_name.rfind("nla.", 0) == 0) {
+                LLAMA_LOG_INFO("%s: preserving application tensor %s outside core model loader\n", __func__, tensor_name.c_str());
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));

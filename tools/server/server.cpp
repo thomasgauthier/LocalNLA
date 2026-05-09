@@ -152,6 +152,10 @@ int main(int argc, char ** argv) {
         routes.post_infill                 = models_routes->proxy_post;
         routes.post_embeddings             = models_routes->proxy_post;
         routes.post_embeddings_oai         = models_routes->proxy_post;
+        routes.post_extract                = models_routes->proxy_post;
+        routes.post_explain                = models_routes->proxy_post;
+        routes.post_reconstruct            = models_routes->proxy_post;
+        routes.post_score                  = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
@@ -197,6 +201,10 @@ int main(int argc, char ** argv) {
     ctx_http.post("/v1/reranking",             ex_wrapper(routes.post_rerank));
     ctx_http.post("/tokenize",                 ex_wrapper(routes.post_tokenize));
     ctx_http.post("/detokenize",               ex_wrapper(routes.post_detokenize));
+    ctx_http.post("/extract",                  ex_wrapper(routes.post_extract));
+    ctx_http.post("/explain",                  ex_wrapper(routes.post_explain));
+    ctx_http.post("/reconstruct",              ex_wrapper(routes.post_reconstruct));
+    ctx_http.post("/score",                    ex_wrapper(routes.post_score));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));

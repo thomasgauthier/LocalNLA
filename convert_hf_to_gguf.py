@@ -3858,7 +3858,54 @@ class Qwen2Model(TextModel):
         super().set_gguf_parameters()
         self._try_set_pooling_type()
 
+        nla_meta = self._nla_meta()
+        if nla_meta is not None and (self.dir_model / "value_head.safetensors").is_file():
+            self.gguf_writer.add_string("nla.role", "critic")
+            self.gguf_writer.add_uint32("nla.extraction_layer", int(nla_meta.get("extraction_layer_index", nla_meta.get("critic", {}).get("extraction_layer_index", 20))))
+            mse_scale = nla_meta.get("extraction", {}).get("mse_scale", 59.86651818838306)
+            self.gguf_writer.add_float32("nla.mse_scale", float(mse_scale))
+            ar_template = nla_meta.get("prompt_templates", {}).get("ar")
+            if ar_template:
+                self.gguf_writer.add_string("nla.prompt_template.ar", str(ar_template))
+
+    def _nla_meta(self) -> dict[str, Any] | None:
+        meta_path = self.dir_model / "nla_meta.yaml"
+        if not meta_path.is_file():
+            return None
+        try:
+            import yaml  # type: ignore[import-not-found]
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception as e:
+            logger.warning("failed to parse nla_meta.yaml: %s", e)
+            return {}
+
+    def _is_nla_critic(self) -> bool:
+        return (self.dir_model / "value_head.safetensors").is_file()
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        yield from super().generate_extra_tensors()
+        if not self._is_nla_critic():
+            return
+
+        if "model.norm.weight" not in self.model_tensors:
+            n_embd = int(self.hparams["hidden_size"])
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.OUTPUT_NORM), torch.ones(n_embd, dtype=torch.float32)
+
+        from safetensors.torch import load_file
+        value_head = load_file(str(self.dir_model / "value_head.safetensors"))["weight"]
+        yield "nla.value_head.weight", value_head
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if new_name == "nla.value_head.weight":
+            return gguf.GGMLQuantizationType.BF16
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("nla."):
+            yield name, data_torch
+            return
         if self.hf_arch == "Qwen2Model":
             name = f"model.{name}"  # map to Qwen2ForCausalLM tensors
         yield from super().modify_tensors(data_torch, name, bid)
