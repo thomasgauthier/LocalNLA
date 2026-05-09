@@ -1,3 +1,9 @@
+> [!WARNING]
+> This repo is codex slop
+
+> [!TIP]
+> The slop might be useful. Please give feedback.
+
 # NLA llama.cpp inference
 
 Local prototype for running Natural Language Autoencoder inference with patched `llama.cpp` servers.
