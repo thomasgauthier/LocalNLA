@@ -8,6 +8,8 @@
 
 Local prototype for running Natural Language Autoencoder inference with patched `llama.cpp` servers.
 
+![NLA demo](demo.gif)
+
 ## Model roles
 
 Full roundtrip uses three models:
