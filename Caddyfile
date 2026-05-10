@@ -1,0 +1,20 @@
+:18090 {
+    handle /extract {
+        reverse_proxy 127.0.0.1:18080
+    }
+    handle /explain {
+        reverse_proxy 127.0.0.1:18082
+    }
+    handle /reconstruct {
+        reverse_proxy 127.0.0.1:18084
+    }
+    handle /score {
+        reverse_proxy 127.0.0.1:18084
+    }
+    handle /edit-direction {
+        reverse_proxy 127.0.0.1:18084
+    }
+    handle {
+        reverse_proxy 127.0.0.1:18080
+    }
+}
