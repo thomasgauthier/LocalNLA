@@ -229,41 +229,42 @@ For CPU-only builds, omit `-DGGML_CUDA=ON`.
 
 ## Start services
 
-Single server with `--actor` and `--critic` flags:
+Three-server architecture with Caddy proxy:
 
 ```bash
+# base server
 build/bin/llama-server \
   -m models/base-q8_0.gguf \
-  --actor models/actor_lora_nla.gguf \
-  --critic models/critic_lora_nla.gguf \
-  -ngl 99 \
-  -c 2048 \
-  --port 18080 \
-  --host 127.0.0.1
-```
+  -ngl 99 -c 2048 --port 18080 --host 127.0.0.1
 
-Alternatively, use generic `--lora` (server discovers roles from `nla.role` metadata):
-
-```bash
+# actor server
 build/bin/llama-server \
-  -m models/base-q8_0.gguf \
-  --lora models/actor_lora_nla.gguf,models/critic_lora_nla.gguf \
-  -ngl 99 \
-  -c 2048 \
-  --port 18080 \
-  --host 127.0.0.1
-```
+  -m models/actor-q8_0.gguf \
+  -ngl 99 -c 512 --port 18082 --host 127.0.0.1 --cache-ram 0
 
-Serve the frontend:
+# critic server (must contain nla.value_head.weight)
+build/bin/llama-server \
+  -m models/critic-nla-q8_0.gguf \
+  -ngl 0 -c 512 -np 1 --port 18084 --host 127.0.0.1 --cache-ram 0
 
-```bash
-python3 -m http.server 3001 --directory frontend
+# Caddy proxy + frontend
+caddy run --config Caddyfile
 ```
 
 Then open:
 
 ```text
-http://127.0.0.1:3001/
+http://127.0.0.1:18090/
+```
+
+Caddy routes:
+
+```text
+/                         -> frontend/index.html
+/extract                  -> base (18080)
+/explain                  -> actor (18082)
+/reconstruct /score /edit-direction -> critic (18084)
+everything else           -> base (18080)
 ```
 
 ## Frontend
