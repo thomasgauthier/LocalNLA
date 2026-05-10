@@ -1478,6 +1478,7 @@ private:
         auto mparams = common_model_params_to_llama(params_base);
         if (!params_base.nla_actor_path.empty() && !actor_is_adapter) {
             SRV_INF("Loading NLA actor full model from %s\n", params_base.nla_actor_path.c_str());
+            mparams.n_gpu_layers = 0; // load actor on CPU to save VRAM
             nla_actor_model = llama_model_load_from_file(params_base.nla_actor_path.c_str(), mparams);
             if (nla_actor_model == nullptr) {
                 SRV_ERR("failed to load actor model '%s'\n", params_base.nla_actor_path.c_str());
@@ -1489,11 +1490,12 @@ private:
                 SRV_ERR("%s\n", "failed to create actor context");
                 return false;
             }
-            SRV_INF("%s\n", "NLA actor full model loaded");
+            SRV_INF("%s\n", "NLA actor full model loaded (CPU)");
         }
 
         if (!params_base.nla_critic_path.empty() && !critic_is_adapter) {
             SRV_INF("Loading NLA critic full model from %s\n", params_base.nla_critic_path.c_str());
+            mparams.n_gpu_layers = 0; // load critic on CPU to save VRAM
             nla_critic_model = llama_model_load_from_file(params_base.nla_critic_path.c_str(), mparams);
             if (nla_critic_model == nullptr) {
                 SRV_ERR("failed to load critic model '%s'\n", params_base.nla_critic_path.c_str());
@@ -1505,7 +1507,7 @@ private:
                 SRV_ERR("%s\n", "failed to create critic context");
                 return false;
             }
-            SRV_INF("%s\n", "NLA critic full model loaded");
+            SRV_INF("%s\n", "NLA critic full model loaded (CPU)");
         }
 
         // Identify NLA actor/critic adapters
