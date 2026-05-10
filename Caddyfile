@@ -23,7 +23,7 @@
 
     # Everything else -> frontend SPA
     handle {
-        root * /workspace/nla-inference/llama.cpp/frontend
+        root * /app/frontend
         try_files {path} /index.html
         file_server
     }
