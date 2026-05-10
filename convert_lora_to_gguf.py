@@ -435,8 +435,11 @@ if __name__ == '__main__':
                             continue
                         logger.error(f"Unexpected name '{name}': Not a lora_A or lora_B tensor")
                         if ".embed_tokens.weight" in name or ".lm_head.weight" in name:
-                            logger.error("Embeddings is present in the adapter. This can be due to new tokens added during fine tuning")
-                            logger.error("Please refer to https://github.com/ggml-org/llama.cpp/pull/9948")
+                            logger.warning(f"Skipping full-rank module_to_save tensor: {name}")
+                            continue
+                        if ".lora_B.bias" in name:
+                            logger.warning(f"Skipping unsupported LoRA bias tensor: {name}")
+                            continue
                         sys.exit(1)
 
                     if base_name in tensor_map:
@@ -462,7 +465,8 @@ if __name__ == '__main__':
                 # therefore, we ignore them for now
                 # see: https://github.com/ggml-org/llama.cpp/issues/9065
                 if name == "lm_head.weight" and len(dest) == 0:
-                    raise ValueError("lm_head is present in adapter, but is ignored in base model")
+                    logger.warning(f"Skipping lm_head.weight with no dest tensors (tied embeddings)")
+                    return
                 for dest_name, dest_data in dest:
                     # mergekit-extract-lora add these layernorm to the adapter
                     if "_norm" in dest_name:

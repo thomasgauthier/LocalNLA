@@ -288,6 +288,9 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
             // TODO: add support for norm vector
             // for now, we don't really care because most adapters still work fine without it
             continue;
+        } else if (name.rfind("nla.", 0) == 0) {
+            LLAMA_LOG_INFO("%s: preserving NLA application tensor %s\n", __func__, name.c_str());
+            continue;
         } else {
             throw std::runtime_error("LoRA tensor '" + name + "' has unexpected suffix");
         }

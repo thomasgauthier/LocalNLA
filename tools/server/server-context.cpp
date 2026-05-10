@@ -674,6 +674,17 @@ public:
     std::vector<float> nla_extract_values;
     int64_t nla_extract_n_tokens = 0;
 
+    // NLA LoRA state: which adapter index is actor/critic
+    size_t nla_actor_lora_idx = 0;
+    size_t nla_critic_lora_idx = 1;
+    std::string nla_critic_lora_path;  // path to critic LoRA GGUF for value_head
+    std::vector<float> nla_cached_value_head;
+    bool nla_value_head_loaded = false;
+    // Cached metadata from the critic LoRA adapter
+    int nla_critic_layer = 20;
+    float nla_critic_mse_scale = 59.866518f;
+    std::string nla_critic_ar_template;
+
     struct nla_runtime_steering_entry {
         int32_t seq_id = -1;
         int32_t token_pos = -1;
@@ -822,6 +833,13 @@ public:
 
     json nla_extract(const json & body) {
         std::lock_guard<std::mutex> lock(nla_mutex);
+
+        // Extract activations from base model (no LoRA)
+        if (!params_base.lora_adapters.empty()) {
+            auto base_lora = nla_make_base_lora_config();
+            common_set_adapter_lora(ctx, base_lora);
+        }
+
         llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
 
         const int layer = json_value(body, "layer", 20);
@@ -881,6 +899,13 @@ public:
 
     json nla_explain(const json & body) {
         std::lock_guard<std::mutex> lock(nla_mutex);
+
+        // Activate actor LoRA for explanation generation
+        if (!params_base.lora_adapters.empty()) {
+            auto actor_lora = nla_make_lora_config(nla_actor_lora_idx, 1.0f);
+            common_set_adapter_lora(ctx, actor_lora);
+        }
+
         llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
 
         if (!body.contains("activation") || !body.contains("input_ids") || !body.contains("inject_pos")) {
@@ -970,8 +995,49 @@ public:
         return std::atof(s.c_str());
     }
 
+    // Read a metadata string from a specific LoRA adapter
+    std::string nla_adapter_meta_str(const common_adapter_lora_info & adapter, const char * key, const std::string & fallback = "") const {
+        if (!adapter.ptr) return fallback;
+        std::vector<char> buf(4096);
+        int32_t n = llama_adapter_meta_val_str(adapter.ptr, key, buf.data(), buf.size());
+        if (n < 0) return fallback;
+        if ((size_t)n >= buf.size()) {
+            buf.resize((size_t)n + 1);
+            n = llama_adapter_meta_val_str(adapter.ptr, key, buf.data(), buf.size());
+            if (n < 0) return fallback;
+        }
+        return std::string(buf.data(), (size_t)n);
+    }
+
+    // Build LoRA config with only one adapter active
+    std::vector<common_adapter_lora_info> nla_make_lora_config(size_t active_idx, float scale = 1.0f) const {
+        auto out = params_base.lora_adapters; // copy
+        for (size_t i = 0; i < out.size(); ++i) {
+            out[i].scale = (i == active_idx) ? scale : 0.0f;
+        }
+        return out;
+    }
+
+    // Build LoRA config with all adapters disabled (base model only)
+    std::vector<common_adapter_lora_info> nla_make_base_lora_config() const {
+        auto out = params_base.lora_adapters; // copy
+        for (auto & l : out) l.scale = 0.0f;
+        return out;
+    }
+
+    // Cached value head loader
+    std::vector<float> nla_load_value_head_cached(int d_model) {
+        if (nla_value_head_loaded) return nla_cached_value_head;
+        nla_cached_value_head = nla_load_value_head_from_gguf(d_model);
+        nla_value_head_loaded = true;
+        return nla_cached_value_head;
+    }
+
     std::vector<float> nla_load_value_head_from_gguf(int d_model) const {
-        const std::string path = params_base.model.path;
+        // Prefer critic LoRA GGUF; fall back to base model GGUF
+        const std::string path = nla_critic_lora_path.empty()
+            ? params_base.model.path
+            : nla_critic_lora_path;
         gguf_init_params gip = { /* no_alloc */ true, /* ctx */ nullptr };
         gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
         if (gctx == nullptr) {
@@ -1047,16 +1113,32 @@ public:
         if (!body.contains("explanation")) {
             throw std::runtime_error("reconstruct requires 'explanation'");
         }
+
+        // Activate critic LoRA for reconstruction
+        if (!params_base.lora_adapters.empty()) {
+            auto critic_lora = nla_make_lora_config(nla_critic_lora_idx, 1.0f);
+            common_set_adapter_lora(ctx, critic_lora);
+        }
+
+        // Role check: relaxed when using LoRA mode (base model has no nla.role)
         const std::string role = nla_meta_str("nla.role");
         if (!role.empty() && role != "critic" && role != "ar") {
             throw std::runtime_error("model metadata nla.role is not 'critic' or 'ar'");
         }
 
         const int d_model = llama_model_n_embd(model);
-        const int layer = json_value(body, "layer", nla_meta_int("nla.extraction_layer", 20));
-        const float mse_scale = json_value(body, "mse_scale", nla_meta_float("nla.mse_scale", 59.866518f));
+        // Use critic adapter metadata if available, otherwise fall back to model metadata, then defaults
+        const int layer = json_value(body, "layer",
+            nla_critic_lora_path.empty()
+                ? nla_meta_int("nla.extraction_layer", 20)
+                : nla_critic_layer);
+        const float mse_scale = json_value(body, "mse_scale",
+            nla_critic_lora_path.empty()
+                ? nla_meta_float("nla.mse_scale", 59.866518f)
+                : nla_critic_mse_scale);
         const std::string default_template = "Summary of the following text: <text>{explanation}</text> <summary>";
-        std::string tmpl = json_value(body, "template", nla_meta_str("nla.prompt_template.ar", default_template));
+        std::string tmpl_default = nla_critic_ar_template.empty() ? default_template : nla_critic_ar_template;
+        std::string tmpl = json_value(body, "template", nla_meta_str("nla.prompt_template.ar", tmpl_default));
         const std::string explanation = body.at("explanation").get<std::string>();
         const std::string marker = "{explanation}";
         const size_t p = tmpl.find(marker);
@@ -1092,7 +1174,7 @@ public:
             h[i] = nla_extract_values[(int64_t)token_pos * d_model + i];
         }
 
-        const std::vector<float> weight = nla_load_value_head_from_gguf(d_model);
+        const std::vector<float> weight = nla_load_value_head_cached(d_model);
         std::vector<float> pred(d_model, 0.0f);
         for (int out = 0; out < d_model; ++out) {
             double acc = 0.0;
@@ -1331,6 +1413,31 @@ private:
         }
 
         vocab = llama_model_get_vocab(model);
+
+        // Identify NLA actor/critic LoRA adapters by their metadata
+        for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+            const auto & la = params_base.lora_adapters[i];
+            if (!la.ptr) continue;
+            const std::string role = nla_adapter_meta_str(la, "nla.role");
+            SRV_INF("NLA LoRA adapter %zu: path=%s, nla.role=%s\n", i, la.path.c_str(), role.c_str());
+            if (role == "actor") {
+                nla_actor_lora_idx = i;
+                SRV_INF("  -> identified as NLA actor\n", 0);
+            } else if (role == "critic" || role == "ar") {
+                nla_critic_lora_idx = i;
+                nla_critic_lora_path = la.path;
+                // Cache critic metadata from the adapter GGUF
+                nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
+                nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
+                nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
+                SRV_INF("  -> identified as NLA critic (layer=%d, mse_scale=%f)\n", nla_critic_layer, nla_critic_mse_scale);
+            }
+        }
+        if (!nla_critic_lora_path.empty()) {
+            SRV_INF("NLA critic LoRA path: %s\n", nla_critic_lora_path.c_str());
+        } else if (!params_base.lora_adapters.empty()) {
+            SRV_WRN("No LoRA adapter found with nla.role=critic/ar; /reconstruct and /score will try base model GGUF for value_head\n", 0);
+        }
 
         n_ctx = llama_n_ctx(ctx);
 

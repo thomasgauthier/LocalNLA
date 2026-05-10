@@ -6,42 +6,42 @@
 > [!TIP]
 > The slop might be useful. Please give feedback.
 
-Local prototype for running Natural Language Autoencoder inference with patched `llama.cpp` servers.
-
-![NLA demo](demo.gif)
+Local prototype for running Natural Language Autoencoder inference with patched `llama.cpp` server.
 
 Features a built-in extended [Mikupad](https://github.com/lmg-anon/mikupad) UI for NLA.
 
+![NLA demo](demo.gif)
+
 ## Model roles
 
-Full roundtrip uses three models:
+Full roundtrip uses three model roles, served from a **single `llama-server`** process using LoRA hot-switching:
 
-1. **Base / target model**
+1. **Base / target model** — the full Qwen2.5-7B GGUF
    - extracts original target activations
    - endpoint: `POST /extract`
 
-2. **Actor / AV model**
+2. **Actor / AV LoRA adapter**
    - activation vector → natural-language explanation
    - endpoint: `POST /explain`
 
-3. **Critic / AR model**
+3. **Critic / AR LoRA adapter** (carries `nla.value_head.weight`)
    - explanation → reconstructed activation
    - endpoints: `POST /reconstruct`, `POST /score`, `POST /edit-direction`
+
+The server identifies adapters by their `nla.role` GGUF metadata (`av` = actor, `ar` = critic) and activates the correct adapter per-request.
 
 ## Default local ports
 
 ```text
-18080  base server
-18082  actor server
-18084  critic server
-3001   Mikupad UI
+18080  single llama-server (all endpoints)
+3001   Mikupad UI (static file server)
 ```
 
 ## Added llama-server endpoints
 
 ### `/extract`
 
-Run on the base/target model.
+Base model only (all LoRA disabled).
 
 ```json
 {
@@ -56,7 +56,7 @@ Returns activation metadata and `activation: [3584 floats]`.
 
 ### `/explain`
 
-Run on the actor model.
+Actor LoRA activated.
 
 ```json
 {
@@ -72,7 +72,7 @@ Returns generated text and parsed explanation.
 
 ### `/reconstruct`
 
-Run on the critic model.
+Critic LoRA activated. Reads `nla.value_head.weight` from the critic adapter GGUF.
 
 ```json
 {
@@ -84,7 +84,7 @@ Returns reconstruction metadata and `activation: [3584 floats]`.
 
 ### `/score`
 
-Run on the critic model.
+Critic LoRA activated.
 
 ```json
 {
@@ -97,7 +97,7 @@ Returns MSE/cosine plus reconstruction metadata.
 
 ### `/edit-direction`
 
-Run on the critic model.
+Critic LoRA activated.
 
 ```json
 {
@@ -110,7 +110,7 @@ Returns `direction = AR(edited_explanation) - AR(original_explanation)` plus nor
 
 ### Steered `/completion`
 
-Run on the base model. Normal `/completion` accepts optional token-level NLA steering:
+Base model only. Normal `/completion` accepts optional token-level NLA steering:
 
 ```json
 {
@@ -137,49 +137,84 @@ h ← h + alpha * ||h|| * direction / ||direction||
 
 GGUF files are generated locally from Hugging Face safetensors repos; they are not committed.
 
-Sources:
-
-```text
-base:   https://huggingface.co/Qwen/Qwen2.5-7B-Instruct
-actor:  https://huggingface.co/kitft/nla-qwen2.5-7b-L20-av
-critic: https://huggingface.co/kitft/nla-qwen2.5-7b-L20-ar
-```
-
-Download HF repos:
+### Base model
 
 ```bash
-uv run --with huggingface_hub huggingface-cli download Qwen/Qwen2.5-7B-Instruct \
-  --local-dir hf/base --local-dir-use-symlinks False
-
-uv run --with huggingface_hub huggingface-cli download kitft/nla-qwen2.5-7b-L20-av \
-  --local-dir hf/actor --local-dir-use-symlinks False
-
-uv run --with huggingface_hub huggingface-cli download kitft/nla-qwen2.5-7b-L20-ar \
-  --local-dir hf/critic --local-dir-use-symlinks False
-```
-
-Convert:
-
-```bash
-mkdir -p models
-
-uv run --with numpy --with sentencepiece --with pyyaml --with safetensors --with transformers \
-  python convert_hf_to_gguf.py hf/base \
+uv run python convert_hf_to_gguf.py hf/base \
   --outfile models/base-q8_0.gguf \
   --outtype q8_0
-
-uv run --with numpy --with sentencepiece --with pyyaml --with safetensors --with transformers \
-  python convert_hf_to_gguf.py hf/actor \
-  --outfile models/actor-q8_0.gguf \
-  --outtype q8_0
-
-uv run --with numpy --with sentencepiece --with pyyaml --with safetensors --with transformers \
-  python convert_hf_to_gguf.py hf/critic \
-  --outfile models/critic-nla-q8_0.gguf \
-  --outtype q8_0
 ```
 
-The patched converter packages critic metadata and `value_head.safetensors` into the critic GGUF as `nla.*` metadata/tensors.
+### LoRA adapters
+
+Extract LoRA adapters from the full actor/critic HF checkpoints against the base model using `mergekit-extract-lora`, then convert to GGUF, then inject NLA metadata.
+
+```bash
+# extract actor LoRA (from mergekit/ directory)
+cd mergekit
+uv run mergekit-extract-lora \
+  --model ../hf/actor \
+  --base-model ../hf/base \
+  --out-path ../adapters/actor_r128 \
+  --max-rank 128 --cuda --skip-undecomposable \
+  --include-regex 'model\.layers\.\d+\.(self_attn|mlp)\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+
+# extract critic LoRA (21 layers only)
+uv run mergekit-extract-lora \
+  --model ../hf/critic \
+  --base-model ../hf/base \
+  --out-path ../adapters/critic_r128 \
+  --max-rank 128 --cuda --skip-undecomposable \
+  --include-regex 'model\.layers\.([0-9]|1[0-9]|20)\.(self_attn|mlp)\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$'
+cd ..
+```
+
+Convert to GGUF:
+
+```bash
+# actor
+uv run python convert_lora_to_gguf.py \
+  --base hf/base \
+  --outfile models/actor_lora.gguf \
+  adapters/actor_r128
+
+# critic
+uv run python convert_lora_to_gguf.py \
+  --base hf/base \
+  --outfile models/critic_lora.gguf \
+  adapters/critic_r128
+```
+
+Inject NLA metadata (and `value_head` tensor for critic):
+
+```bash
+# actor: role=av, no value_head
+uv run python ../scripts/inject_nla_into_lora_gguf.py \
+  --lora-gguf models/actor_lora.gguf \
+  --meta-yaml hf/actor/nla_meta.yaml \
+  --nla-role av \
+  --output models/actor_lora_nla.gguf
+
+# critic: role=ar, with value_head
+uv run python ../scripts/inject_nla_into_lora_gguf.py \
+  --lora-gguf models/critic_lora.gguf \
+  --meta-yaml hf/critic/nla_meta.yaml \
+  --nla-role ar \
+  --value-head hf/critic/value_head.safetensors \
+  --output models/critic_lora_nla.gguf
+```
+
+### Full-model GGUFs (legacy three-server mode)
+
+The previous approach used three separate full-model servers. These are still supported but no longer recommended:
+
+```bash
+uv run python convert_hf_to_gguf.py hf/actor \
+  --outfile models/actor-q8_0.gguf --outtype q8_0
+
+uv run python convert_hf_to_gguf.py hf/critic \
+  --outfile models/critic-nla-q8_0.gguf --outtype q8_0
+```
 
 ## Build llama.cpp
 
@@ -194,46 +229,19 @@ For CPU-only builds, omit `-DGGML_CUDA=ON`.
 
 ## Start services
 
-`frontend/index.html` expects these ports:
-
-```text
-18080  base server (`/completion`, `/extract`, steered `/completion`)
-18082  actor server (`/explain`)
-18084  critic server (`/reconstruct`, `/score`, `/edit-direction`)
-```
-
-Run one `llama-server` per role:
+Single server with both LoRA adapters:
 
 ```bash
-# base server
 build/bin/llama-server \
   -m models/base-q8_0.gguf \
+  --lora models/actor_lora_nla.gguf,models/critic_lora_nla.gguf \
   -ngl 99 \
   -c 2048 \
   --port 18080 \
   --host 127.0.0.1
-
-# actor server
-build/bin/llama-server \
-  -m models/actor-q8_0.gguf \
-  -ngl 99 \
-  -c 512 \
-  --port 18082 \
-  --host 127.0.0.1 \
-  --cache-ram 0
-
-# critic server
-build/bin/llama-server \
-  -m models/critic-nla-q8_0.gguf \
-  -ngl 0 \
-  -c 512 \
-  -np 1 \
-  --port 18084 \
-  --host 127.0.0.1 \
-  --cache-ram 0
 ```
 
-Serve the frontend on port 3001:
+Serve the frontend:
 
 ```bash
 python3 -m http.server 3001 --directory frontend
@@ -257,8 +265,12 @@ modal Score reconstruction button → /score
 ## Important files
 
 ```text
-convert_hf_to_gguf.py                    patched converter
-frontend/index.html                      frontend
-examples/extract-layer/                  activation extraction CLI
-examples/nla-generate/                   actor injection/generation CLI
+src/llama-adapter.cpp                     nla.* tensor skip in adapter loader
+convert_hf_to_gguf.py                     patched converter (skip modules_to_save)
+convert_lora_to_gguf.py                   patched (skip full-rank + bias tensors)
+tools/server/server-context.cpp           LoRA hot-switching + NLA endpoints
+frontend/index.html                       frontend
+scripts/inject_nla_into_lora_gguf.py      inject NLA metadata into LoRA GGUFs
+examples/extract-layer/                   activation extraction CLI
+examples/nla-generate/                    actor injection/generation CLI
 ```
