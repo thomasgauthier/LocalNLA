@@ -674,15 +674,86 @@ public:
     std::vector<float> nla_extract_values;
     int64_t nla_extract_n_tokens = 0;
 
-    bool nla_eval_cb(struct ggml_tensor * t, bool ask) {
-        if (!nla_extract_active) {
-            return false;
+    struct nla_runtime_steering_entry {
+        int32_t seq_id = -1;
+        int32_t token_pos = -1;
+        int32_t layer = 20;
+        float alpha = 1.0f;
+        std::vector<float> direction;
+        double direction_norm = 0.0;
+    };
+
+    std::vector<nla_runtime_steering_entry> nla_steering_active;
+    std::vector<llama_pos> nla_steering_batch_pos;
+    std::vector<llama_seq_id> nla_steering_batch_seq;
+
+    static std::string nla_layer_tensor_name(int layer) {
+        return "l_out-" + std::to_string(layer);
+    }
+
+    bool nla_steering_wants_tensor(const std::string & name) const {
+        for (const auto & entry : nla_steering_active) {
+            if (name == nla_layer_tensor_name(entry.layer)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void nla_apply_steering_to_tensor(struct ggml_tensor * t) {
+        if (t->type != GGML_TYPE_F32 || t->ne[0] != llama_model_n_embd(model)) {
+            return;
+        }
+        const int64_t d_model = t->ne[0];
+        const int64_t n_tokens = t->ne[1];
+        if ((int64_t) nla_steering_batch_pos.size() < n_tokens || (int64_t) nla_steering_batch_seq.size() < n_tokens) {
+            return;
         }
         const std::string name(t->name);
-        if (name != nla_extract_tensor) {
+        std::vector<float> values(ggml_nelements(t));
+        ggml_backend_tensor_get(t, values.data(), 0, ggml_nbytes(t));
+        bool changed = false;
+        for (int64_t ib = 0; ib < n_tokens; ++ib) {
+            for (const auto & entry : nla_steering_active) {
+                if (entry.direction_norm < 1e-12) continue;
+                if (entry.seq_id != nla_steering_batch_seq[ib]) continue;
+                if (entry.token_pos != nla_steering_batch_pos[ib]) continue;
+                if (name != nla_layer_tensor_name(entry.layer)) continue;
+                if ((int64_t) entry.direction.size() != d_model) continue;
+
+                double h_ss = 0.0;
+                for (int64_t i = 0; i < d_model; ++i) {
+                    const float x = values[ib * d_model + i];
+                    h_ss += double(x) * double(x);
+                }
+                const double h_norm = std::sqrt(h_ss);
+                if (h_norm < 1e-12) continue;
+                const float scale = float(double(entry.alpha) * h_norm / entry.direction_norm);
+                for (int64_t i = 0; i < d_model; ++i) {
+                    values[ib * d_model + i] += scale * entry.direction[i];
+                }
+                changed = true;
+            }
+        }
+        if (changed) {
+            ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t));
+        }
+    }
+
+    bool nla_eval_cb(struct ggml_tensor * t, bool ask) {
+        const std::string name(t->name);
+        const bool wants_extract = nla_extract_active && name == nla_extract_tensor;
+        const bool wants_steering = !nla_steering_active.empty() && nla_steering_wants_tensor(name);
+        if (!wants_extract && !wants_steering) {
             return false;
         }
         if (ask) {
+            return true;
+        }
+        if (wants_steering) {
+            nla_apply_steering_to_tensor(t);
+        }
+        if (!wants_extract) {
             return true;
         }
         const int64_t n_el = ggml_nelements(t);
@@ -1066,6 +1137,42 @@ public:
     json nla_reconstruct(const json & body) {
         std::lock_guard<std::mutex> lock(nla_mutex);
         return nla_reconstruct_result_json(nla_reconstruct_no_lock(body));
+    }
+
+    json nla_edit_direction(const json & body) {
+        std::lock_guard<std::mutex> lock(nla_mutex);
+        if (!body.contains("original_explanation") || !body.contains("edited_explanation")) {
+            throw std::runtime_error("/edit-direction requires 'original_explanation' and 'edited_explanation'");
+        }
+
+        json orig_body = body;
+        orig_body["explanation"] = body.at("original_explanation");
+        json edit_body = body;
+        edit_body["explanation"] = body.at("edited_explanation");
+
+        nla_reconstruct_result orig = nla_reconstruct_no_lock(orig_body);
+        nla_reconstruct_result edit = nla_reconstruct_no_lock(edit_body);
+        if (orig.activation.size() != edit.activation.size()) {
+            throw std::runtime_error("edit direction reconstruction size mismatch");
+        }
+
+        std::vector<float> direction(orig.activation.size());
+        for (size_t i = 0; i < direction.size(); ++i) {
+            direction[i] = edit.activation[i] - orig.activation[i];
+        }
+
+        return json{
+            {"direction", direction},
+            {"direction_norm", nla_norm(direction)},
+            {"original_norm", orig.norm},
+            {"edited_norm", edit.norm},
+            {"d_model", orig.d_model},
+            {"layer", orig.layer},
+            {"tensor", orig.tensor},
+            {"mse_scale", orig.mse_scale},
+            {"n_prompt_tokens_original", orig.n_prompt_tokens},
+            {"n_prompt_tokens_edited", edit.n_prompt_tokens},
+        };
     }
 
     json nla_score(const json & body) {
@@ -3255,7 +3362,39 @@ private:
                 batch.logits   + i,
             };
 
+            nla_steering_active.clear();
+            nla_steering_batch_pos.clear();
+            nla_steering_batch_seq.clear();
+            nla_steering_batch_pos.reserve(n_tokens);
+            nla_steering_batch_seq.reserve(n_tokens);
+            for (int32_t j = 0; j < n_tokens; ++j) {
+                nla_steering_batch_pos.push_back(batch_view.pos[j]);
+                nla_steering_batch_seq.push_back(batch_view.n_seq_id[j] > 0 ? batch_view.seq_id[j][0] : -1);
+            }
+            for (auto & slot : slots) {
+                if (!slot.is_processing() || !slot.task || slot.task->params.nla_steering.empty()) {
+                    continue;
+                }
+                for (const auto & entry : slot.task->params.nla_steering) {
+                    if ((int64_t) entry.direction.size() != llama_model_n_embd(model)) {
+                        continue;
+                    }
+                    nla_runtime_steering_entry runtime;
+                    runtime.seq_id = slot.id;
+                    runtime.token_pos = entry.token_pos;
+                    runtime.layer = entry.layer;
+                    runtime.alpha = entry.alpha;
+                    runtime.direction = entry.direction;
+                    runtime.direction_norm = nla_norm(runtime.direction);
+                    nla_steering_active.push_back(std::move(runtime));
+                }
+            }
+
             const int ret = llama_decode(ctx, batch_view);
+
+            nla_steering_active.clear();
+            nla_steering_batch_pos.clear();
+            nla_steering_batch_seq.clear();
 
             metrics.on_decoded(slots);
 
@@ -4488,6 +4627,17 @@ void server_routes::init_routes() {
         try {
             const json body = json::parse(req.body);
             res->ok(const_cast<server_context_impl &>(ctx_server).nla_score(body));
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        }
+        return res;
+    };
+
+    this->post_edit_direction = [this](const server_http_req & req) {
+        auto res = create_response();
+        try {
+            const json body = json::parse(req.body);
+            res->ok(const_cast<server_context_impl &>(ctx_server).nla_edit_direction(body));
         } catch (const std::exception & e) {
             res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         }

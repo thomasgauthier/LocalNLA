@@ -26,7 +26,7 @@ Full roundtrip uses three models:
 
 3. **Critic / AR model**
    - explanation → reconstructed activation
-   - endpoints: `POST /reconstruct`, `POST /score`
+   - endpoints: `POST /reconstruct`, `POST /score`, `POST /edit-direction`
 
 ## Default local ports
 
@@ -95,6 +95,44 @@ Run on the critic model.
 
 Returns MSE/cosine plus reconstruction metadata.
 
+### `/edit-direction`
+
+Run on the critic model.
+
+```json
+{
+  "original_explanation": "...",
+  "edited_explanation": "..."
+}
+```
+
+Returns `direction = AR(edited_explanation) - AR(original_explanation)` plus norms/metadata.
+
+### Steered `/completion`
+
+Run on the base model. Normal `/completion` accepts optional token-level NLA steering:
+
+```json
+{
+  "prompt": "...",
+  "n_predict": 128,
+  "steering": [
+    {
+      "token_pos": 123,
+      "layer": 20,
+      "alpha": 1.0,
+      "direction": [3584 floats]
+    }
+  ]
+}
+```
+
+At that prompt token/layer, the server applies:
+
+```text
+h ← h + alpha * ||h|| * direction / ||direction||
+```
+
 ## Create GGUFs
 
 GGUF files are generated locally from Hugging Face safetensors repos; they are not committed.
@@ -159,9 +197,9 @@ For CPU-only builds, omit `-DGGML_CUDA=ON`.
 `frontend/index.html` expects these ports:
 
 ```text
-18080  base server (`/completion`, `/extract`)
+18080  base server (`/completion`, `/extract`, steered `/completion`)
 18082  actor server (`/explain`)
-18084  critic server (`/reconstruct`, `/score`)
+18084  critic server (`/reconstruct`, `/score`, `/edit-direction`)
 ```
 
 Run one `llama-server` per role:

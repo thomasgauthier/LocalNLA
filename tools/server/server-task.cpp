@@ -265,6 +265,32 @@ task_params server_task::params_from_json_cmpl(
     params.t_max_predict_ms = json_value(data,       "t_max_predict_ms",   defaults.t_max_predict_ms);
     params.response_fields  = json_value(data,       "response_fields",    std::vector<std::string>());
 
+    if (data.contains("steering")) {
+        if (!data.at("steering").is_array()) {
+            throw std::runtime_error("completion 'steering' must be an array");
+        }
+        for (const auto & item : data.at("steering")) {
+            if (!item.contains("token_pos") || !item.contains("direction")) {
+                throw std::runtime_error("completion steering entries require 'token_pos' and 'direction'");
+            }
+            task_params::nla_steering_entry entry;
+            entry.token_pos = item.at("token_pos").get<int32_t>();
+            entry.layer     = json_value(item, "layer", 20);
+            entry.alpha     = json_value(item, "alpha", 1.0f);
+            entry.direction = item.at("direction").get<std::vector<float>>();
+            if (entry.token_pos < 0) {
+                throw std::runtime_error("completion steering token_pos must be non-negative");
+            }
+            if (entry.direction.empty()) {
+                throw std::runtime_error("completion steering direction must be non-empty");
+            }
+            params.nla_steering.push_back(std::move(entry));
+        }
+        if (!params.nla_steering.empty()) {
+            params.cache_prompt = false;
+        }
+    }
+
     params.sampling.top_k              = json_value(data, "top_k",               defaults.sampling.top_k);
     params.sampling.top_p              = json_value(data, "top_p",               defaults.sampling.top_p);
     params.sampling.min_p              = json_value(data, "min_p",               defaults.sampling.min_p);

@@ -156,6 +156,7 @@ int main(int argc, char ** argv) {
         routes.post_explain                = models_routes->proxy_post;
         routes.post_reconstruct            = models_routes->proxy_post;
         routes.post_score                  = models_routes->proxy_post;
+        routes.post_edit_direction         = models_routes->proxy_post;
         routes.post_rerank                 = models_routes->proxy_post;
         routes.post_tokenize               = models_routes->proxy_post;
         routes.post_detokenize             = models_routes->proxy_post;
@@ -205,6 +206,7 @@ int main(int argc, char ** argv) {
     ctx_http.post("/explain",                  ex_wrapper(routes.post_explain));
     ctx_http.post("/reconstruct",              ex_wrapper(routes.post_reconstruct));
     ctx_http.post("/score",                    ex_wrapper(routes.post_score));
+    ctx_http.post("/edit-direction",           ex_wrapper(routes.post_edit_direction));
     ctx_http.post("/apply-template",           ex_wrapper(routes.post_apply_template));
     // LoRA adapters hotswap
     ctx_http.get ("/lora-adapters",            ex_wrapper(routes.get_lora_adapters));

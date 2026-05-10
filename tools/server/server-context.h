@@ -121,6 +121,7 @@ struct server_routes {
     server_http_context::handler_t post_explain;
     server_http_context::handler_t post_reconstruct;
     server_http_context::handler_t post_score;
+    server_http_context::handler_t post_edit_direction;
     server_http_context::handler_t post_embeddings;
     server_http_context::handler_t post_embeddings_oai;
     server_http_context::handler_t post_rerank;

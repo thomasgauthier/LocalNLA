@@ -991,10 +991,25 @@ button.processing {
 	white-space: pre-wrap;
 	margin-top: 0.75em;
 }
-.nla-score {
+.nla-score, .nla-steering {
 	margin-top: 0.75em;
 	padding-top: 0.75em;
 	border-top: 1px solid var(--color-border-1);
+}
+.nla-steering textarea {
+	box-sizing: border-box;
+	width: 100%;
+	min-height: 8em;
+	margin: 0.4em 0 0.75em;
+	background: var(--color-bg-input-1);
+	color: var(--color-text-1);
+	border: 1px solid var(--color-border-1);
+	border-radius: 4px;
+	padding: 0.5em;
+}
+.nla-steered {
+	background: color-mix(in srgb, var(--color-miku) 18%, transparent) !important;
+	text-decoration: underline wavy var(--color-miku);
 }
 @keyframes processing {
 	from { outline-width: 0px; }
@@ -1355,7 +1370,7 @@ const API_KOBOLD_CPP = 2;
 const API_OPENAI_COMPAT = 3;
 const API_AI_HORDE = 4;
 
-const NLA_EXTRACT_ENDPOINT = 'http://127.0.0.1:18083';
+const NLA_EXTRACT_ENDPOINT = 'http://127.0.0.1:18080';
 const NLA_ACTOR_ENDPOINT = 'http://127.0.0.1:18082';
 const NLA_CRITIC_ENDPOINT = 'http://127.0.0.1:18084';
 const NLA_ACTOR_INPUT_IDS = `151644 8948 198 2610 525 1207 16948 11 3465 553 54364 14817 13 1446 525 264 10950 17847 13 151645 198 151644 872 198 2610 525 264 95178 15235 31085 30374 458 2989 8814 1119 15099 22879 504 264 4128 1614 13 4615 8084 3383 374 311 7512 279 41733 2213 315 429 15099 4621 382 1654 686 1494 279 4621 43810 304 366 68487 29 9492 1119 697 2266 13 1446 1969 1221 8193 458 16148 369 279 4621 11 43810 2878 366 327 35890 29 9492 13 576 16148 17167 315 220 17 12 18 1467 68642 22692 429 4621 382 8420 374 279 4621 1447 27 68487 29 149705 522 68487 1339 5501 3410 458 16148 13 151645 198 151644 77091 198`.trim().split(/\s+/).map(Number);
@@ -1660,6 +1675,13 @@ async function nlaScoreExplanation({ criticEndpoint = NLA_CRITIC_ENDPOINT, expla
 	}, signal);
 }
 
+async function nlaEditDirection({ criticEndpoint = NLA_CRITIC_ENDPOINT, originalExplanation, editedExplanation, signal }) {
+	return nlaPostJson(`${criticEndpoint}/edit-direction`, {
+		original_explanation: originalExplanation,
+		edited_explanation: editedExplanation,
+	}, signal);
+}
+
 async function llamaCppDetokenize({ endpoint, endpointAPIKey, proxyEndpoint, signal, ...options }) {
 	const res = await fetch(`${proxyEndpoint ?? endpoint}/detokenize`, {
 		method: 'POST',
@@ -1687,7 +1709,7 @@ async function* llamaCppCompletion({ endpoint, endpointAPIKey, proxyEndpoint, si
 		},
 		body: JSON.stringify({
 			...options,
-			cache_prompt: true,
+			cache_prompt: options.steering?.length ? false : true,
 		}),
 		signal,
 	});
@@ -6310,7 +6332,7 @@ html.ereader #sidebar {
 };
 
 const defaultPresets = {
-	endpoint: 'http://127.0.0.1:8080',
+	endpoint: 'http://127.0.0.1:18080',
 	endpointAPI: 0,
 	endpointAPIKey: '',
 	endpointModel: '',
@@ -6712,8 +6734,13 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 	const [nlaLayer, setNlaLayer] = useState(20);
 	const [nlaLoading, setNlaLoading] = useState(false);
 	const [nlaScoreLoading, setNlaScoreLoading] = useState(false);
+	const [nlaSteeringLoading, setNlaSteeringLoading] = useState(false);
+	const [nlaEditedExplanation, setNlaEditedExplanation] = useState('');
+	const [nlaSteeringAlpha, setNlaSteeringAlpha] = useState(1.0);
 	const [nlaError, setNlaError] = useState(undefined);
 	const [nlaResult, setNlaResult] = useState(undefined);
+	const [nlaExplanationCache, setNlaExplanationCache] = useState({});
+	const [nlaSteeringEdits, setNlaSteeringEdits] = useState({});
 	const [userChunkSubTokens, setUserChunkSubTokens] = useState({});
 
 	async function ensureUserChunkTokens(chunkIndex) {
@@ -6793,6 +6820,19 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 		setNlaError(undefined);
 		setNlaResult(undefined);
 		setNlaScoreLoading(false);
+		setNlaSteeringLoading(false);
+		setNlaEditedExplanation('');
+		const steeringKey = `${currentPromptChunk.index}:${currentPromptChunk.subIndex ?? ''}`;
+		const cacheKey = `${steeringKey}:L${Number(nlaLayer)}`;
+		const cached = nlaExplanationCache[cacheKey];
+		if (cached) {
+			const originalExplanation = cached.explained.explanation || cached.explained.text || '';
+			setNlaEditedExplanation(nlaSteeringEdits[steeringKey]?.editedExplanation || originalExplanation);
+			setNlaSteeringAlpha(nlaSteeringEdits[steeringKey]?.alpha ?? 1.0);
+			setNlaResult(cached);
+			setNlaLoading(false);
+			return;
+		}
 		setNlaLoading(true);
 		try {
 			if (endpointAPI !== API_LLAMA_CPP) {
@@ -6804,6 +6844,7 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 				endpointAPI,
 				endpointAPIKey,
 				content: promptText,
+				add_special: true,
 				...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
 			});
 			const hoveredChunk = promptChunks[currentPromptChunk.index];
@@ -6818,6 +6859,7 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 				endpointAPI,
 				endpointAPIKey,
 				content: prefixText,
+				add_special: true,
 				...(isMikupadEndpoint ? { proxyEndpoint: sessionStorage.proxyEndpoint } : {})
 			});
 			const tokenPos = tokenizedPrefix.ids.length - 1;
@@ -6830,7 +6872,11 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 				tokenPos,
 				layer: Number(nlaLayer),
 			});
-			setNlaResult({
+			const existingSteeringKey = steeringKey;
+			const originalExplanation = result.explained.explanation || result.explained.text || '';
+			setNlaEditedExplanation(nlaSteeringEdits[existingSteeringKey]?.editedExplanation || originalExplanation);
+			setNlaSteeringAlpha(nlaSteeringEdits[existingSteeringKey]?.alpha ?? 1.0);
+			const cachedResult = {
 				token: {
 					index: tokenPos,
 					id: tokenizedFull.ids[tokenPos],
@@ -6838,13 +6884,60 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 					chunkIndex: currentPromptChunk.index,
 					subIndex: currentPromptChunk.subIndex,
 				},
+				steeringKey: existingSteeringKey,
 				...result
-			});
+			};
+			setNlaResult(cachedResult);
+			setNlaExplanationCache(prev => ({ ...prev, [cacheKey]: cachedResult }));
 		} catch (e) {
 			setNlaError(e.message || String(e));
 		} finally {
 			setNlaLoading(false);
 		}
+	}
+
+	async function saveCurrentNlaSteering() {
+		if (!nlaResult || nlaSteeringLoading) return;
+		setNlaError(undefined);
+		setNlaSteeringLoading(true);
+		try {
+			const originalExplanation = nlaResult.explained.explanation || nlaResult.explained.text;
+			if (!originalExplanation) throw new Error('No original explanation available.');
+			if (!nlaEditedExplanation.trim()) throw new Error('Edited explanation is empty.');
+			const direction = await nlaEditDirection({
+				originalExplanation,
+				editedExplanation: nlaEditedExplanation,
+			});
+			setNlaSteeringEdits(prev => ({
+				...prev,
+				[nlaResult.steeringKey]: {
+					enabled: true,
+					chunkIndex: nlaResult.token.chunkIndex,
+					subIndex: nlaResult.token.subIndex,
+					token_pos: nlaResult.token.index,
+					layer: Number(nlaLayer),
+					alpha: Number(nlaSteeringAlpha),
+					originalExplanation,
+					editedExplanation: nlaEditedExplanation,
+					direction: direction.direction,
+					direction_norm: direction.direction_norm,
+				}
+			}));
+			setNlaResult(prev => prev ? ({ ...prev, editDirection: direction }) : prev);
+		} catch (e) {
+			setNlaError(e.message || String(e));
+		} finally {
+			setNlaSteeringLoading(false);
+		}
+	}
+
+	function clearCurrentNlaSteering() {
+		if (!nlaResult) return;
+		setNlaSteeringEdits(prev => {
+			const next = { ...prev };
+			delete next[nlaResult.steeringKey];
+			return next;
+		});
 	}
 
 	async function scoreCurrentNlaExplanation() {
@@ -7522,6 +7615,17 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 
 			let startTime = 0;
 			setTokensPerSec(0.0);
+
+			const activeNlaSteering = endpointAPI === API_LLAMA_CPP && !useChatAPI
+				? Object.values(nlaSteeringEdits)
+					.filter(edit => edit?.enabled && edit.direction?.length)
+					.map(edit => ({
+						token_pos: edit.token_pos,
+						layer: edit.layer,
+						alpha: edit.alpha,
+						direction: edit.direction,
+					}))
+				: [];
 			
 			for await (const chunk of (useChatAPI ? chatCompletion : completion)({
 				endpoint,
@@ -7599,6 +7703,7 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 				n_predict: maxPredictTokens,
 				n_probs: 10,
 				...(endpointAPI === API_LLAMA_CPP ? { post_sampling_probs: postSamplingProbs } : {}),
+				...(activeNlaSteering.length ? { steering: activeNlaSteering } : {}),
 				stream: useTokenStreaming,
 				...(stopParam.length ? { stop: stopParam } : {}),
 				signal: ac.signal,
@@ -8755,16 +8860,21 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 						}
 						const isCurrent = currentPromptChunk && currentPromptChunk.index === i;
 						const isNextUndo = undoHovered && !!undoStack.current.length && undoStack.current.at(-1) <= i;
+						const chunkSteeringKey = `${i}:`;
+						const isChunkSteered = !!nlaSteeringEdits[chunkSteeringKey]?.enabled;
 						const subTokens = chunk.type === 'user' && userChunkSubTokens[i]?.content === chunk.content ? userChunkSubTokens[i].tokens : undefined;
 						if (subTokens) {
 							return html`<span key=${i} className=${`user-chunk ${isNextUndo ? 'erase' : ''}`}>
 								${subTokens.map((tok, si) => {
 									const subIsCurrent = isCurrent && currentPromptChunk?.subIndex === si;
+									const steeringKey = `${i}:${si}`;
+									const isSteered = !!nlaSteeringEdits[steeringKey]?.enabled;
 									return html`<span
 										key=${si}
 										data-promptchunk=${i}
 										data-subtoken=${si}
-										className=${`user ${subIsCurrent ? 'current' : ''}`}>
+										title=${isSteered ? `NLA steering active · layer ${nlaSteeringEdits[steeringKey].layer} · α ${nlaSteeringEdits[steeringKey].alpha}` : undefined}
+										className=${`user ${subIsCurrent ? 'current' : ''} ${isSteered ? 'nla-steered' : ''}`}>
 										${tok === '\n' ? ' \n' : tok}
 									</span>`;
 								})}
@@ -8775,7 +8885,8 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 								key=${i}
 								data-promptchunk=${i}
 								style=${bgColor ? { '--bg-color': bgColor } : {}}
-								className=${`${(tokenHighlightMode === 1 && !isCurrent) || chunk.type === 'user' ? 'user' : 'machine'} ${isCurrent ? 'current' : ''} ${isNextUndo ? 'erase' : ''}`}>
+								title=${isChunkSteered ? `NLA steering active · layer ${nlaSteeringEdits[chunkSteeringKey].layer} · α ${nlaSteeringEdits[chunkSteeringKey].alpha}` : undefined}
+								className=${`${(tokenHighlightMode === 1 && !isCurrent) || chunk.type === 'user' ? 'user' : 'machine'} ${isCurrent ? 'current' : ''} ${isNextUndo ? 'erase' : ''} ${isChunkSteered ? 'nla-steered' : ''}`}>
 								${(chunk.content === '\n' ? ' \n' : chunk.content) + (i === promptChunks.length - 1 && chunk.content.endsWith('\n') && promptPreviewChunks.length === 0 ? '\u00a0' : '')}
 							</span>`;
 					})}
@@ -8817,6 +8928,20 @@ export function App({ sessionStorage, templateStorage, themeStorage, useSessionS
 									<div>reconstructed norm ${Number(nlaResult.score.reconstructed_norm).toFixed(3)} · activation norm ${Number(nlaResult.score.activation_norm).toFixed(3)}</div>
 									<div>critic layer ${nlaResult.score.layer} · ${nlaResult.score.tensor} · mse scale ${Number(nlaResult.score.mse_scale).toFixed(3)}</div>
 								</div>` : null}
+							<div className="nla-steering">
+								<div><b>NLA steering edit</b></div>
+								<label>Edited explanation</label>
+								<textarea value=${nlaEditedExplanation} onInput=${e => setNlaEditedExplanation(e.target.value)} />
+								<div className="nla-controls">
+									<label>α <input type="number" step="0.1" value=${nlaSteeringAlpha} onChange=${e => setNlaSteeringAlpha(e.target.value)} /></label>
+									<div>
+										<button disabled=${nlaSteeringLoading} onClick=${saveCurrentNlaSteering}>${nlaSteeringLoading ? 'Building direction...' : 'Save steering'}</button>
+										<button disabled=${nlaSteeringLoading || !nlaSteeringEdits[nlaResult.steeringKey]} onClick=${clearCurrentNlaSteering}>Clear steering</button>
+									</div>
+								</div>
+								${nlaSteeringEdits[nlaResult.steeringKey] ? html`<div>Steering active · direction norm ${Number(nlaSteeringEdits[nlaResult.steeringKey].direction_norm).toFixed(3)}</div>` : null}
+								${nlaResult.editDirection ? html`<div>Built direction norm ${Number(nlaResult.editDirection.direction_norm).toFixed(3)}</div>` : null}
+							</div>
 						</div>` : null}
 				</div>
 			</div>` : null}

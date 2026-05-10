@@ -47,6 +47,13 @@ enum stop_type {
 };
 
 struct task_params {
+    struct nla_steering_entry {
+        int32_t token_pos = -1;
+        int32_t layer     = 20;
+        float alpha       = 1.0f;
+        std::vector<float> direction;
+    };
+
     bool stream          = true;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
@@ -65,6 +72,8 @@ struct task_params {
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
     std::map<int, float> lora; // mapping adapter ID -> scale
+
+    std::vector<nla_steering_entry> nla_steering;
 
     std::vector<std::string> antiprompt;
     std::vector<std::string> response_fields;
