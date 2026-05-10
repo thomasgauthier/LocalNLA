@@ -1414,23 +1414,45 @@ private:
 
         vocab = llama_model_get_vocab(model);
 
-        // Identify NLA actor/critic LoRA adapters by their metadata
-        for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
-            const auto & la = params_base.lora_adapters[i];
-            if (!la.ptr) continue;
-            const std::string role = nla_adapter_meta_str(la, "nla.role");
-            SRV_INF("NLA LoRA adapter %zu: path=%s, nla.role=%s\n", i, la.path.c_str(), role.c_str());
-            if (role == "actor") {
-                nla_actor_lora_idx = i;
-                SRV_INF("  -> identified as NLA actor\n", 0);
-            } else if (role == "critic" || role == "ar") {
-                nla_critic_lora_idx = i;
-                nla_critic_lora_path = la.path;
-                // Cache critic metadata from the adapter GGUF
-                nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
-                nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
-                nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
-                SRV_INF("  -> identified as NLA critic (layer=%d, mse_scale=%f)\n", nla_critic_layer, nla_critic_mse_scale);
+        // Identify NLA actor/critic LoRA adapters
+        // Priority: --actor/--critic CLI flags > nla.role metadata discovery
+        const bool has_cli_nla = !params_base.nla_actor_path.empty() || !params_base.nla_critic_path.empty();
+        if (has_cli_nla) {
+            // Direct identification via --actor / --critic flags
+            for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                const auto & la = params_base.lora_adapters[i];
+                if (la.path == params_base.nla_actor_path) {
+                    nla_actor_lora_idx = i;
+                    SRV_INF("NLA actor adapter %zu: path=%s (via --actor)\n", i, la.path.c_str());
+                }
+                if (la.path == params_base.nla_critic_path) {
+                    nla_critic_lora_idx = i;
+                    nla_critic_lora_path = la.path;
+                    // Cache critic metadata from the adapter GGUF
+                    nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
+                    nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
+                    nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
+                    SRV_INF("NLA critic adapter %zu: path=%s (via --critic, layer=%d, mse_scale=%f)\n", i, la.path.c_str(), nla_critic_layer, nla_critic_mse_scale);
+                }
+            }
+        } else {
+            // Fallback: discover by nla.role metadata
+            for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                const auto & la = params_base.lora_adapters[i];
+                if (!la.ptr) continue;
+                const std::string role = nla_adapter_meta_str(la, "nla.role");
+                SRV_INF("NLA LoRA adapter %zu: path=%s, nla.role=%s\n", i, la.path.c_str(), role.c_str());
+                if (role == "actor") {
+                    nla_actor_lora_idx = i;
+                    SRV_INF("  -> identified as NLA actor\n", 0);
+                } else if (role == "critic" || role == "ar") {
+                    nla_critic_lora_idx = i;
+                    nla_critic_lora_path = la.path;
+                    nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
+                    nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
+                    nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
+                    SRV_INF("  -> identified as NLA critic (layer=%d, mse_scale=%f)\n", nla_critic_layer, nla_critic_mse_scale);
+                }
             }
         }
         if (!nla_critic_lora_path.empty()) {

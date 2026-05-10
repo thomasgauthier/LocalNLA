@@ -497,6 +497,10 @@ struct common_params {
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 
+    // NLA-specific adapter paths (loaded as LoRA, identified by role)
+    std::string nla_actor_path;   // --actor path to actor LoRA GGUF
+    std::string nla_critic_path;  // --critic path to critic LoRA GGUF
+
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO

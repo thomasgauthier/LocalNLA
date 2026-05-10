@@ -229,7 +229,20 @@ For CPU-only builds, omit `-DGGML_CUDA=ON`.
 
 ## Start services
 
-Single server with both LoRA adapters:
+Single server with `--actor` and `--critic` flags:
+
+```bash
+build/bin/llama-server \
+  -m models/base-q8_0.gguf \
+  --actor models/actor_lora_nla.gguf \
+  --critic models/critic_lora_nla.gguf \
+  -ngl 99 \
+  -c 2048 \
+  --port 18080 \
+  --host 127.0.0.1
+```
+
+Alternatively, use generic `--lora` (server discovers roles from `nla.role` metadata):
 
 ```bash
 build/bin/llama-server \

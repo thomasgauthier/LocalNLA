@@ -3179,6 +3179,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--actor"}, "FNAME",
+        "path to NLA actor LoRA adapter GGUF (role=av)",
+        [](common_params & params, const std::string & value) {
+            params.nla_actor_path = value;
+            params.lora_adapters.push_back({ value, 1.0, "", "", nullptr });
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--critic"}, "FNAME",
+        "path to NLA critic LoRA adapter GGUF (role=ar, carries nla.value_head.weight)",
+        [](common_params & params, const std::string & value) {
+            params.nla_critic_path = value;
+            params.lora_adapters.push_back({ value, 1.0, "", "", nullptr });
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--sleep-idle-seconds"}, "SECONDS",
         string_format("number of seconds of idleness after which the server will sleep (default: %d; -1 = disabled)", params.sleep_idle_seconds),
         [](common_params & params, int value) {
