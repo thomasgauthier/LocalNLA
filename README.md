@@ -12,6 +12,37 @@ Features a built-in extended [Mikupad](https://github.com/lmg-anon/mikupad) UI f
 
 ![NLA demo](demo.gif)
 
+## Quickstart
+
+### Docker (recommended)
+
+```bash
+docker run -it --gpus all -p 18090:18090 \
+  -v /path/to/models/where/you/want/models/saved:/models \
+  ghcr.io/thomasgauthier/nla.cpp:cuda
+```
+
+The container prompts interactively for the desired quantization level (BF16, Q8_0, Q6_K, Q4_K_M) and downloads them automatically.
+
+If you already have models, pass them directly:
+
+```bash
+docker run --gpus all -p 18090:18090 \
+  -v /path/to/models:/models:ro \
+  -e BASE_MODEL=/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  -e ACTOR_MODEL=/models/nla-qwen2.5-7b-L20-av-Q4_K_M.gguf \
+  -e CRITIC_MODEL=/models/nla-qwen2.5-7b-L20-ar-Q4_K_M.gguf \
+  ghcr.io/thomasgauthier/nla.cpp:cuda
+```
+
+The UI will be available at `http://localhost:18090/`.
+
+For CPU-only builds, use the `:cpu` tag instead of `:cuda`.
+
+### Manual build
+
+See [Build llama.cpp](#build-llamacpp) and [Manual three-server setup](#manual-three-server-setup) below.
+
 ## Model roles
 
 Full roundtrip uses three model roles, served from a **single `llama-server`** process using LoRA hot-switching:
@@ -227,7 +258,7 @@ cmake --build build --config Release -j$(nproc) --target llama-server
 
 For CPU-only builds, omit `-DGGML_CUDA=ON`.
 
-## Start services
+## Manual three-server setup
 
 Three-server architecture with Caddy proxy:
 
