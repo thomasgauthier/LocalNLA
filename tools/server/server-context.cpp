@@ -662,10 +662,13 @@ public:
 
     ~server_context_impl() {
         if (!sleeping) {
-            // destroy() is already called when entering sleeping state
-            // we don't call it again here to avoid double free
             destroy();
         }
+        // Clean up NLA secondary models/contexts (in case destroy() wasn't called)
+        if (nla_actor_ctx) { llama_free(nla_actor_ctx); nla_actor_ctx = nullptr; }
+        if (nla_actor_model) { llama_model_free(nla_actor_model); nla_actor_model = nullptr; }
+        if (nla_critic_ctx) { llama_free(nla_critic_ctx); nla_critic_ctx = nullptr; }
+        if (nla_critic_model) { llama_model_free(nla_critic_model); nla_critic_model = nullptr; }
     }
 
     std::mutex nla_mutex;
@@ -674,7 +677,11 @@ public:
     std::vector<float> nla_extract_values;
     int64_t nla_extract_n_tokens = 0;
 
-    // NLA LoRA state: which adapter index is actor/critic
+    // NLA secondary full models (when --actor/--critic point to full model GGUFs)
+    llama_model * nla_actor_model = nullptr;
+    llama_context * nla_actor_ctx = nullptr;
+    llama_model * nla_critic_model = nullptr;
+    llama_context * nla_critic_ctx = nullptr;
     size_t nla_actor_lora_idx = 0;
     size_t nla_critic_lora_idx = 1;
     std::string nla_critic_lora_path;  // path to critic LoRA GGUF for value_head
@@ -802,7 +809,7 @@ public:
         return std::sqrt(ss);
     }
 
-    bool nla_eval_tokens(const std::vector<llama_token> & toks, int start_pos, bool logits_last) {
+    bool nla_eval_tokens(llama_context * eval_ctx, const std::vector<llama_token> & toks, int start_pos, bool logits_last) {
         if (toks.empty()) return true;
         llama_batch b = llama_batch_init((int32_t)toks.size(), 0, 1);
         b.n_tokens = (int32_t)toks.size();
@@ -813,12 +820,12 @@ public:
             b.seq_id[i][0] = NLA_SEQ_ID;
             b.logits[i] = logits_last && i == b.n_tokens - 1;
         }
-        const int rc = llama_decode(ctx, b);
+        const int rc = llama_decode(eval_ctx, b);
         llama_batch_free(b);
         return rc == 0;
     }
 
-    bool nla_eval_embedding(const std::vector<float> & embd, int pos, bool logits) {
+    bool nla_eval_embedding(llama_context * eval_ctx, const std::vector<float> & embd, int pos, bool logits) {
         llama_batch b = llama_batch_init(1, (int32_t)embd.size(), 1);
         b.n_tokens = 1;
         memcpy(b.embd, embd.data(), sizeof(float) * embd.size());
@@ -826,7 +833,7 @@ public:
         b.n_seq_id[0] = 1;
         b.seq_id[0][0] = NLA_SEQ_ID;
         b.logits[0] = logits;
-        const int rc = llama_decode(ctx, b);
+        const int rc = llama_decode(eval_ctx, b);
         llama_batch_free(b);
         return rc == 0;
     }
@@ -864,7 +871,7 @@ public:
         nla_extract_n_tokens = 0;
         nla_extract_active = true;
         llama_set_embeddings(ctx, true);
-        const bool ok = nla_eval_tokens(toks, 0, false);
+        const bool ok = nla_eval_tokens(ctx, toks, 0, false);
         llama_set_embeddings(ctx, false);
         nla_extract_active = false;
         if (!ok) {
@@ -900,13 +907,17 @@ public:
     json nla_explain(const json & body) {
         std::lock_guard<std::mutex> lock(nla_mutex);
 
-        // Activate actor LoRA for explanation generation
-        if (!params_base.lora_adapters.empty()) {
+        // Select actor context: full model if loaded, otherwise base ctx with actor LoRA
+        llama_context * actor_ctx = nla_actor_ctx ? nla_actor_ctx : ctx;
+        llama_model * actor_model = nla_actor_model ? nla_actor_model : model;
+
+        // Activate actor LoRA only if actor is not a full model
+        if (!params_base.lora_adapters.empty() && !nla_actor_ctx) {
             auto actor_lora = nla_make_lora_config(nla_actor_lora_idx, 1.0f);
             common_set_adapter_lora(ctx, actor_lora);
         }
 
-        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(actor_ctx), NLA_SEQ_ID, -1, -1);
 
         if (!body.contains("activation") || !body.contains("input_ids") || !body.contains("inject_pos")) {
             throw std::runtime_error("/explain requires activation, input_ids, inject_pos");
@@ -918,16 +929,16 @@ public:
         const float scale = json_value(body, "scale", 150.0f);
         const int n_predict = json_value(body, "n_predict", json_value(body, "max_new_tokens", 200));
 
-        const int d_model = llama_model_n_embd(model);
+        const int d_model = llama_model_n_embd(actor_model);
         if ((int)act.size() != d_model) throw std::runtime_error("activation length != model n_embd");
         if (inject_pos < 0 || inject_pos >= (int)ids.size()) throw std::runtime_error("inject_pos out of range");
         if (normalize) nla_normalize(act, scale);
 
         std::vector<llama_token> prefix(ids.begin(), ids.begin() + inject_pos);
         std::vector<llama_token> suffix(ids.begin() + inject_pos + 1, ids.end());
-        if (!nla_eval_tokens(prefix, 0, false)) throw std::runtime_error("failed to eval prefix");
-        if (!nla_eval_embedding(act, inject_pos, suffix.empty())) throw std::runtime_error("failed to eval injection embedding");
-        if (!nla_eval_tokens(suffix, inject_pos + 1, true)) throw std::runtime_error("failed to eval suffix");
+        if (!nla_eval_tokens(actor_ctx, prefix, 0, false)) throw std::runtime_error("failed to eval prefix");
+        if (!nla_eval_embedding(actor_ctx, act, inject_pos, suffix.empty())) throw std::runtime_error("failed to eval injection embedding");
+        if (!nla_eval_tokens(actor_ctx, suffix, inject_pos + 1, true)) throw std::runtime_error("failed to eval suffix");
 
         auto sparams = llama_sampler_chain_default_params();
         llama_sampler * smpl = llama_sampler_chain_init(sparams);
@@ -939,11 +950,11 @@ public:
         std::string text;
         int n_gen = 0;
         for (int i = 0; i < n_predict; ++i) {
-            llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+            llama_token tok = llama_sampler_sample(smpl, actor_ctx, -1);
             if (llama_vocab_is_eog(vocab, tok)) break;
-            text += common_token_to_piece(ctx, tok, true);
+            text += common_token_to_piece(actor_ctx, tok, true);
             std::vector<llama_token> one = { tok };
-            if (!nla_eval_tokens(one, (int)ids.size() + i, true)) break;
+            if (!nla_eval_tokens(actor_ctx, one, (int)ids.size() + i, true)) break;
             n_gen++;
             if (text.find("</explanation>") != std::string::npos) break;
         }
@@ -955,7 +966,7 @@ public:
         if (std::regex_search(text, m, re)) {
             explanation = m[1].str();
         }
-        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(actor_ctx), NLA_SEQ_ID, -1, -1);
         return json{
             {"text", text},
             {"explanation", explanation},
@@ -993,6 +1004,20 @@ public:
         const std::string s = nla_meta_str(key);
         if (s.empty()) return fallback;
         return std::atof(s.c_str());
+    }
+
+    bool nla_is_adapter_gguf(const std::string & path) const {
+        gguf_init_params gip = { /* no_alloc */ true, /* ctx */ nullptr };
+        gguf_context * gctx = gguf_init_from_file(path.c_str(), gip);
+        if (gctx == nullptr) return false;
+        int tid = gguf_find_key(gctx, "general.type");
+        bool result = false;
+        if (tid >= 0) {
+            const char * type = gguf_get_val_str(gctx, tid);
+            result = type && strcmp(type, "adapter") == 0;
+        }
+        gguf_free(gctx);
+        return result;
     }
 
     // Read a metadata string from a specific LoRA adapter
@@ -1108,14 +1133,18 @@ public:
     };
 
     nla_reconstruct_result nla_reconstruct_no_lock(const json & body) {
-        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        // Select critic context: full model if loaded, otherwise base ctx with critic LoRA
+        llama_context * critic_ctx = nla_critic_ctx ? nla_critic_ctx : ctx;
+        llama_model * critic_model = nla_critic_model ? nla_critic_model : model;
+
+        llama_memory_seq_rm(llama_get_memory(critic_ctx), NLA_SEQ_ID, -1, -1);
 
         if (!body.contains("explanation")) {
             throw std::runtime_error("reconstruct requires 'explanation'");
         }
 
-        // Activate critic LoRA for reconstruction
-        if (!params_base.lora_adapters.empty()) {
+        // Activate critic LoRA only if critic is not a full model
+        if (!params_base.lora_adapters.empty() && !nla_critic_ctx) {
             auto critic_lora = nla_make_lora_config(nla_critic_lora_idx, 1.0f);
             common_set_adapter_lora(ctx, critic_lora);
         }
@@ -1126,7 +1155,7 @@ public:
             throw std::runtime_error("model metadata nla.role is not 'critic' or 'ar'");
         }
 
-        const int d_model = llama_model_n_embd(model);
+        const int d_model = llama_model_n_embd(critic_model);
         // Use critic adapter metadata if available, otherwise fall back to model metadata, then defaults
         const int layer = json_value(body, "layer",
             nla_critic_lora_path.empty()
@@ -1154,9 +1183,9 @@ public:
         nla_extract_values.clear();
         nla_extract_n_tokens = 0;
         nla_extract_active = true;
-        llama_set_embeddings(ctx, true);
-        const bool ok = nla_eval_tokens(toks, 0, false);
-        llama_set_embeddings(ctx, false);
+        llama_set_embeddings(critic_ctx, true);
+        const bool ok = nla_eval_tokens(critic_ctx, toks, 0, false);
+        llama_set_embeddings(critic_ctx, false);
         nla_extract_active = false;
         if (!ok) {
             throw std::runtime_error("llama_decode failed during reconstruct");
@@ -1185,7 +1214,7 @@ public:
             pred[out] = (float) acc;
         }
 
-        llama_memory_seq_rm(llama_get_memory(ctx), NLA_SEQ_ID, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(critic_ctx), NLA_SEQ_ID, -1, -1);
         const double pred_norm = nla_norm(pred);
         return nla_reconstruct_result{
             /* activation      */ std::move(pred),
@@ -1271,7 +1300,8 @@ public:
             gold = body.at("extracted").get<std::vector<float>>();
         }
 
-        const int d_model = llama_model_n_embd(model);
+        llama_model * critic_model = nla_critic_model ? nla_critic_model : model;
+        const int d_model = llama_model_n_embd(critic_model);
         if ((int)gold.size() != d_model) throw std::runtime_error("activation length != model n_embd");
 
         nla_reconstruct_result rec = nla_reconstruct_no_lock(body);
@@ -1363,6 +1393,12 @@ private:
         }
 
         llama_batch_free(batch);
+
+        // Destroy NLA secondary models/contexts
+        if (nla_actor_ctx) { llama_free(nla_actor_ctx); nla_actor_ctx = nullptr; }
+        if (nla_actor_model) { llama_model_free(nla_actor_model); nla_actor_model = nullptr; }
+        if (nla_critic_ctx) { llama_free(nla_critic_ctx); nla_critic_ctx = nullptr; }
+        if (nla_critic_model) { llama_model_free(nla_critic_model); nla_critic_model = nullptr; }
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1402,6 +1438,30 @@ private:
         params_base.cb_eval_user_data = this;
         params_base.warmup = false;
 
+        // Determine if --actor/--critic paths are LoRA adapters or full models
+        bool actor_is_adapter = false;
+        bool critic_is_adapter = false;
+        if (!params_base.nla_actor_path.empty()) {
+            actor_is_adapter = nla_is_adapter_gguf(params_base.nla_actor_path);
+            SRV_INF("--actor %s detected as %s\n", params_base.nla_actor_path.c_str(), actor_is_adapter ? "adapter" : "full model");
+        }
+        if (!params_base.nla_critic_path.empty()) {
+            critic_is_adapter = nla_is_adapter_gguf(params_base.nla_critic_path);
+            SRV_INF("--critic %s detected as %s\n", params_base.nla_critic_path.c_str(), critic_is_adapter ? "adapter" : "full model");
+        }
+
+        // Remove full-model paths from lora_adapters so common_init doesn't fail
+        auto it = params_base.lora_adapters.begin();
+        while (it != params_base.lora_adapters.end()) {
+            bool is_actor = it->path == params_base.nla_actor_path;
+            bool is_critic = it->path == params_base.nla_critic_path;
+            if ((is_actor && !actor_is_adapter) || (is_critic && !critic_is_adapter)) {
+                it = params_base.lora_adapters.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model = llama_init->model();
@@ -1414,51 +1474,76 @@ private:
 
         vocab = llama_model_get_vocab(model);
 
-        // Identify NLA actor/critic LoRA adapters
-        // Priority: --actor/--critic CLI flags > nla.role metadata discovery
-        const bool has_cli_nla = !params_base.nla_actor_path.empty() || !params_base.nla_critic_path.empty();
-        if (has_cli_nla) {
-            // Direct identification via --actor / --critic flags
-            for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
-                const auto & la = params_base.lora_adapters[i];
-                if (la.path == params_base.nla_actor_path) {
-                    nla_actor_lora_idx = i;
-                    SRV_INF("NLA actor adapter %zu: path=%s (via --actor)\n", i, la.path.c_str());
-                }
-                if (la.path == params_base.nla_critic_path) {
-                    nla_critic_lora_idx = i;
-                    nla_critic_lora_path = la.path;
-                    // Cache critic metadata from the adapter GGUF
-                    nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
-                    nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
-                    nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
-                    SRV_INF("NLA critic adapter %zu: path=%s (via --critic, layer=%d, mse_scale=%f)\n", i, la.path.c_str(), nla_critic_layer, nla_critic_mse_scale);
-                }
+        // Load full models for actor/critic if needed
+        auto mparams = common_model_params_to_llama(params_base);
+        if (!params_base.nla_actor_path.empty() && !actor_is_adapter) {
+            SRV_INF("Loading NLA actor full model from %s\n", params_base.nla_actor_path.c_str());
+            nla_actor_model = llama_model_load_from_file(params_base.nla_actor_path.c_str(), mparams);
+            if (nla_actor_model == nullptr) {
+                SRV_ERR("failed to load actor model '%s'\n", params_base.nla_actor_path.c_str());
+                return false;
             }
-        } else {
-            // Fallback: discover by nla.role metadata
-            for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
-                const auto & la = params_base.lora_adapters[i];
-                if (!la.ptr) continue;
-                const std::string role = nla_adapter_meta_str(la, "nla.role");
-                SRV_INF("NLA LoRA adapter %zu: path=%s, nla.role=%s\n", i, la.path.c_str(), role.c_str());
-                if (role == "actor") {
-                    nla_actor_lora_idx = i;
-                    SRV_INF("  -> identified as NLA actor\n", 0);
-                } else if (role == "critic" || role == "ar") {
-                    nla_critic_lora_idx = i;
-                    nla_critic_lora_path = la.path;
-                    nla_critic_layer = std::atoi(nla_adapter_meta_str(la, "nla.extraction_layer", "20").c_str());
-                    nla_critic_mse_scale = std::atof(nla_adapter_meta_str(la, "nla.mse_scale", "59.866518").c_str());
-                    nla_critic_ar_template = nla_adapter_meta_str(la, "nla.prompt_template.ar", "");
-                    SRV_INF("  -> identified as NLA critic (layer=%d, mse_scale=%f)\n", nla_critic_layer, nla_critic_mse_scale);
+            auto cparams = common_context_params_to_llama(params_base);
+            nla_actor_ctx = llama_new_context_with_model(nla_actor_model, cparams);
+            if (nla_actor_ctx == nullptr) {
+                SRV_ERR("%s\n", "failed to create actor context");
+                return false;
+            }
+            SRV_INF("%s\n", "NLA actor full model loaded");
+        }
+
+        if (!params_base.nla_critic_path.empty() && !critic_is_adapter) {
+            SRV_INF("Loading NLA critic full model from %s\n", params_base.nla_critic_path.c_str());
+            nla_critic_model = llama_model_load_from_file(params_base.nla_critic_path.c_str(), mparams);
+            if (nla_critic_model == nullptr) {
+                SRV_ERR("failed to load critic model '%s'\n", params_base.nla_critic_path.c_str());
+                return false;
+            }
+            auto cparams = common_context_params_to_llama(params_base);
+            nla_critic_ctx = llama_new_context_with_model(nla_critic_model, cparams);
+            if (nla_critic_ctx == nullptr) {
+                SRV_ERR("%s\n", "failed to create critic context");
+                return false;
+            }
+            SRV_INF("%s\n", "NLA critic full model loaded");
+        }
+
+        // Identify NLA actor/critic adapters
+        if (!params_base.nla_actor_path.empty()) {
+            if (actor_is_adapter) {
+                for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                    if (params_base.lora_adapters[i].path == params_base.nla_actor_path) {
+                        nla_actor_lora_idx = i;
+                        SRV_INF("NLA actor adapter %zu: path=%s (via --actor)\n", i, params_base.nla_actor_path.c_str());
+                        break;
+                    }
                 }
+            } else {
+                SRV_INF("NLA actor full model: path=%s\n", params_base.nla_actor_path.c_str());
+            }
+        }
+        if (!params_base.nla_critic_path.empty()) {
+            if (critic_is_adapter) {
+                for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                    if (params_base.lora_adapters[i].path == params_base.nla_critic_path) {
+                        nla_critic_lora_idx = i;
+                        nla_critic_lora_path = params_base.nla_critic_path;
+                        nla_critic_layer = std::atoi(nla_adapter_meta_str(params_base.lora_adapters[i], "nla.extraction_layer", "20").c_str());
+                        nla_critic_mse_scale = std::atof(nla_adapter_meta_str(params_base.lora_adapters[i], "nla.mse_scale", "59.866518").c_str());
+                        nla_critic_ar_template = nla_adapter_meta_str(params_base.lora_adapters[i], "nla.prompt_template.ar", "");
+                        SRV_INF("NLA critic adapter %zu: path=%s (via --critic, layer=%d, mse_scale=%f)\n", i, params_base.nla_critic_path.c_str(), nla_critic_layer, nla_critic_mse_scale);
+                        break;
+                    }
+                }
+            } else {
+                nla_critic_lora_path = params_base.nla_critic_path;
+                SRV_INF("NLA critic full model: path=%s\n", params_base.nla_critic_path.c_str());
             }
         }
         if (!nla_critic_lora_path.empty()) {
-            SRV_INF("NLA critic LoRA path: %s\n", nla_critic_lora_path.c_str());
+            SRV_INF("NLA critic source path: %s\n", nla_critic_lora_path.c_str());
         } else if (!params_base.lora_adapters.empty()) {
-            SRV_WRN("No LoRA adapter found with nla.role=critic/ar; /reconstruct and /score will try base model GGUF for value_head\n", 0);
+            SRV_WRN("%s\n", "No LoRA adapter found with nla.role=critic/ar; /reconstruct and /score will try base model GGUF for value_head");
         }
 
         n_ctx = llama_n_ctx(ctx);
