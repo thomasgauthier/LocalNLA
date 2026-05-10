@@ -1,10 +1,10 @@
 :18090 {
-    handle /extract {
-        reverse_proxy 127.0.0.1:18080
-    }
+    # Actor endpoints
     handle /explain {
         reverse_proxy 127.0.0.1:18082
     }
+
+    # Critic endpoints
     handle /reconstruct {
         reverse_proxy 127.0.0.1:18084
     }
@@ -14,6 +14,14 @@
     handle /edit-direction {
         reverse_proxy 127.0.0.1:18084
     }
+
+    # All other API endpoints -> base server
+    @api path /extract /tokenize /detokenize /completion /embeddings /embedding /health /props /slots /models /v1/* /api/*
+    handle @api {
+        reverse_proxy 127.0.0.1:18080
+    }
+
+    # Everything else -> frontend SPA
     handle {
         root * /workspace/nla-inference/llama.cpp/frontend
         try_files {path} /index.html
