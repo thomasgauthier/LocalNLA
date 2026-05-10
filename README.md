@@ -229,7 +229,7 @@ For CPU-only builds, omit `-DGGML_CUDA=ON`.
 
 ## Start services
 
-Single server with `--actor` and `--critic` flags. The server auto-detects whether each file is a LoRA adapter or a full model GGUF:
+Single server with `--actor` and `--critic` flags:
 
 ```bash
 build/bin/llama-server \
@@ -241,31 +241,6 @@ build/bin/llama-server \
   --port 18080 \
   --host 127.0.0.1
 ```
-
-You can also use full model GGUFs directly (no LoRA extraction needed):
-
-```bash
-build/bin/llama-server \
-  -m models/base-q8_0.gguf \
-  --actor models/actor-q8_0.gguf \
-  --critic models/critic-nla-q8_0.gguf \
-  -ngl 99 \
-  -c 2048 \
-  --port 18080 \
-  --host 127.0.0.1
-```
-
-Or mix and match — actor as LoRA, critic as full model:
-
-```bash
-build/bin/llama-server \
-  -m models/base-q8_0.gguf \
-  --actor models/actor_lora_nla.gguf \
-  --critic models/critic-nla-q8_0.gguf \
-  -ngl 99 -c 2048 --port 18080
-```
-
-The server peeks at the GGUF `general.type` metadata to determine adapter vs. full model.
 
 Alternatively, use generic `--lora` (server discovers roles from `nla.role` metadata):
 
