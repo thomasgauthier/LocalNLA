@@ -1,6 +1,6 @@
 # NLA llama.cpp inference
 
-Natural Language Autoencoder inference with a patched llama.cpp server
+[Natural Language Autoencoder](https://www.anthropic.com/research/natural-language-autoencoders) inference with a patched llama.cpp server
 and a built-in [Mikupad](https://github.com/lmg-anon/mikupad) UI.
 
 ![NLA demo](demo.gif)
