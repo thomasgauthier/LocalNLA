@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 ARG UBUNTU_VERSION=24.04
 ARG BASE_DEV_CONTAINER=ubuntu:${UBUNTU_VERSION}
 ARG BASE_RUN_CONTAINER=ubuntu:${UBUNTU_VERSION}
@@ -13,7 +14,9 @@ ENV CC="ccache gcc-14" CXX="ccache g++-14"
 
 WORKDIR /app
 
-COPY . .
+# Copy the source tree for the native build, but leave the app frontend out of
+# this expensive stage so editing frontend/index.html does not invalidate it.
+COPY --exclude=frontend . .
 
 # Cache ccache across docker builds
 RUN --mount=type=cache,target=/root/.ccache \
@@ -45,13 +48,14 @@ COPY --from=build /app/out/nla-generate /usr/local/bin/
 # Shared libs (symlinks preserved)
 COPY --from=build /app/out/ /usr/local/lib/
 
-# Frontend + Caddy config
-COPY --from=build /app/frontend/ /app/frontend/
-COPY --from=build /app/Caddyfile /app/Caddyfile
-
-# Startup script
+# Caddy config + startup script
+COPY Caddyfile /app/Caddyfile
 COPY docker-entrypoint.sh /app/
 RUN chmod +x /app/docker-entrypoint.sh
+
+# Frontend is copied directly from the build context and late in the Dockerfile,
+# so changing frontend/index.html only rebuilds this cheap layer and metadata after it.
+COPY frontend/ /app/frontend/
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
 ENV LLAMA_ARG_HOST=0.0.0.0
